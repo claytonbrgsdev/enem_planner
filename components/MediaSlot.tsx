@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-const LOCAL_VIDEO_URL = "/assets/video_telinha.mp4";
+const LOCAL_VIDEO_URL = "./assets/video_telinha.mp4";
 const FALLBACK_VIDEO_URL = "https://videos.pexels.com/video-files/3120282/3120282-hd_1920_1080_25fps.mp4";
 
 const MediaSlot: React.FC = () => {
