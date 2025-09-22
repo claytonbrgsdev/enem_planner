@@ -4,35 +4,48 @@ export enum Tab {
   Settings = 'Configurações',
 }
 
-export type EnemIncidence = 'baixa' | 'media' | 'alta';
+export type PriorityColor = 'green' | 'yellow' | 'red';
 
-export interface HistoryEntry {
+export interface StudyHistoryEntry {
+  date: string; // ISO string
+  notes: string;
+  type: 'study' | 'review';
+}
+
+export interface CalendarEntry {
+  id: string;
   date: string; // YYYY-MM-DD
-  confidence: number; // 1-5
+  timestamp: string; // ISO string with time
+  type: 'study' | 'review';
+  title: string;
+  disciplineId: string;
+  disciplineName: string;
+  topicId: string;
   notes?: string;
+  reviewSequence?: number;
 }
 
-export interface Subtopic {
+export interface StudyTopic {
   id: string;
+  disciplineId: string;
   name: string;
-  difficulty: number; // 1-5
-  enemIncidence: EnemIncidence;
-  lastStudied: string | null; // YYYY-MM-DD
-  confidence: number; // 1-5
-  history: HistoryEntry[];
-}
-
-export interface Topic {
-  id: string;
-  name: string;
-  subtopics: Subtopic[];
+  description: string;
+  incidence: number;
+  difficulty: number;
+  needsReview: boolean;
+  priorityScore: number;
+  priorityColor: PriorityColor;
+  completionDate: string | null;
+  history: StudyHistoryEntry[];
+  isAssigned?: boolean;
 }
 
 export interface Discipline {
   id: string;
   name: string;
   weight: number;
-  topics: Topic[];
+  topics: StudyTopic[];
+  pending: number;
 }
 
 export type TaskType = 'study' | 'review';
@@ -83,6 +96,7 @@ export interface AppState {
   settings: AppSettings;
   disciplines: Discipline[];
   plans: Record<string, DailyPlan>; // Keyed by date string YYYY-MM-DD
+  calendar: CalendarEntry[];
   showSplashScreen: boolean;
   lastReorganized: string | null;
 }

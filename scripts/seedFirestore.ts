@@ -154,9 +154,12 @@ const buildConfig = (input: FirestoreDiscipline[]): GioConfig => ({
     topics: discipline.topics.map((topic) => ({ ...topic })),
     pending: discipline.topics.filter((topic) => !topic.isAssigned && !topic.completionDate).length
   })),
+  calendar: [],
   lastUpdated: new Date().toISOString(),
   version: '1.0.0'
 });
+
+const SEED_USER_ID = 'seed';
 
 const hasServiceAccount = Boolean(process.env.FIREBASE_SERVICE_ACCOUNT || process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
@@ -188,10 +191,10 @@ const runWithClientSdk = async () => {
     await signInAnonymously(auth);
 
     console.log('Limpando banco de dados do Firestore...');
-    await saveGioConfigToFirestore(buildConfig([]));
+    await saveGioConfigToFirestore(SEED_USER_ID, buildConfig([]));
 
     console.log('Populando com novos dados...');
-    await saveGioConfigToFirestore(buildConfig(disciplines));
+    await saveGioConfigToFirestore(SEED_USER_ID, buildConfig(disciplines));
     console.log('Concluido.');
   } catch (error: any) {
     if (error?.code === 'auth/admin-restricted-operation') {

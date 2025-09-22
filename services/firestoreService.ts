@@ -30,18 +30,31 @@ export type FirestoreDiscipline = {
   topics: FirestoreTopic[];
 };
 
+export type FirestoreCalendarEntry = {
+  id: string;
+  date: string;
+  timestamp: string;
+  type: 'study' | 'review';
+  title: string;
+  disciplineId: string;
+  disciplineName: string;
+  topicId: string;
+  notes?: string;
+  reviewSequence?: number;
+};
+
 export interface GioConfig {
   disciplines: FirestoreDiscipline[];
+  calendar: FirestoreCalendarEntry[];
   lastUpdated: string;
   version: string;
 }
 
 const GIO_CONFIG_COLLECTION = 'gio_config';
-const DISCIPLINES_DOC = 'disciplines';
 
-export const loadGioConfigFromFirestore = async (): Promise<GioConfig | null> => {
+export const loadGioConfigFromFirestore = async (userId: string): Promise<GioConfig | null> => {
   try {
-    const docRef = doc(db, GIO_CONFIG_COLLECTION, DISCIPLINES_DOC);
+    const docRef = doc(db, GIO_CONFIG_COLLECTION, userId);
     const docSnap = await getDoc(docRef);
 
     if (!docSnap.exists()) {
@@ -51,6 +64,7 @@ export const loadGioConfigFromFirestore = async (): Promise<GioConfig | null> =>
     const data = docSnap.data();
     return {
       disciplines: (data.disciplines || []) as FirestoreDiscipline[],
+      calendar: (data.calendar || []) as FirestoreCalendarEntry[],
       lastUpdated: data.lastUpdated || new Date().toISOString(),
       version: data.version || '1.0.0'
     };
@@ -60,9 +74,9 @@ export const loadGioConfigFromFirestore = async (): Promise<GioConfig | null> =>
   }
 };
 
-export const saveGioConfigToFirestore = async (config: GioConfig): Promise<boolean> => {
+export const saveGioConfigToFirestore = async (userId: string, config: GioConfig): Promise<boolean> => {
   try {
-    const docRef = doc(db, GIO_CONFIG_COLLECTION, DISCIPLINES_DOC);
+    const docRef = doc(db, GIO_CONFIG_COLLECTION, userId);
     await setDoc(docRef, {
       ...config,
       lastUpdated: new Date().toISOString()

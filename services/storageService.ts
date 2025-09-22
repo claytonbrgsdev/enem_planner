@@ -1,99 +1,199 @@
-
-import { type AppState } from '../types';
+import { type AppState, type Discipline, type StudyTopic, type StudyHistoryEntry, type CalendarEntry } from '../types';
 import { INITIAL_APP_STATE } from '../constants';
-import { loadGioConfigFromFirestore, saveGioConfigToFirestore, type GioConfig } from './firestoreService';
+import {
+  loadGioConfigFromFirestore,
+  saveGioConfigToFirestore,
+  type GioConfig,
+  type FirestoreDiscipline,
+  type FirestoreTopic,
+  type FirestoreHistoryEntry,
+  type FirestoreCalendarEntry
+} from './firestoreService';
 
 const STORAGE_KEY = 'gio-study-app-state';
 
-// Synchronous version for initial state loading
+const cloneHistoryEntry = (entry: FirestoreHistoryEntry): StudyHistoryEntry => ({
+  date: entry?.date ?? new Date().toISOString(),
+  notes: entry?.notes ?? '',
+  type: entry?.type === 'review' ? 'review' : 'study'
+});
+
+const ensureStudyTopic = (disciplineId: string, topic: FirestoreTopic): StudyTopic => ({
+  id: topic.id,
+  disciplineId,
+  name: topic.name,
+  description: topic.description ?? '',
+  incidence: topic.incidence ?? 1,
+  difficulty: topic.difficulty ?? 1,
+  needsReview: Boolean(topic.needsReview),
+  priorityScore: topic.priorityScore ?? 1,
+  priorityColor: topic.priorityColor ?? 'green',
+  completionDate: topic.completionDate ?? null,
+  history: Array.isArray(topic.history) ? topic.history.map(cloneHistoryEntry) : [],
+  isAssigned: Boolean(topic.isAssigned)
+});
+
+const ensureDiscipline = (discipline: FirestoreDiscipline): Discipline => {
+  const topics = discipline.topics.map((topic) => ensureStudyTopic(discipline.id, topic));
+  return {
+    id: discipline.id,
+    name: discipline.name,
+    weight: discipline.weight ?? 1,
+    topics,
+    pending: discipline.pending ?? topics.filter((topic) => !topic.completionDate).length
+  };
+};
+
+const ensureCalendarEntry = (entry: FirestoreCalendarEntry): CalendarEntry => ({
+  id: entry.id,
+  date: entry.date,
+  timestamp: entry.timestamp,
+  type: entry.type === 'review' ? 'review' : 'study',
+  title: entry.title,
+  disciplineId: entry.disciplineId ?? '',
+  disciplineName: entry.disciplineName ?? '',
+  topicId: entry.topicId ?? '',
+  notes: entry.notes ?? undefined,
+  reviewSequence: typeof entry.reviewSequence === 'number' ? entry.reviewSequence : undefined
+});
+
+const serializeCalendarEntry = (entry: CalendarEntry): FirestoreCalendarEntry => {
+  const payload: FirestoreCalendarEntry = {
+    id: entry.id,
+    date: entry.date,
+    timestamp: entry.timestamp,
+    type: entry.type,
+    title: entry.title,
+    disciplineId: entry.disciplineId,
+    disciplineName: entry.disciplineName,
+    topicId: entry.topicId
+  };
+
+  if (entry.notes && entry.notes.trim().length > 0) {
+    payload.notes = entry.notes.trim();
+  }
+  if (typeof entry.reviewSequence === 'number') {
+    payload.reviewSequence = entry.reviewSequence;
+  }
+
+  return payload;
+};
+
+const toFirestorePayload = (disciplines: Discipline[], calendar: CalendarEntry[]): GioConfig => ({
+  disciplines: disciplines.map((discipline) => ({
+    id: discipline.id,
+    name: discipline.name,
+    weight: discipline.weight,
+    pending: discipline.pending,
+    topics: discipline.topics.map((topic) => ({
+      id: topic.id,
+      disciplineId: topic.disciplineId,
+      name: topic.name,
+      description: topic.description,
+      incidence: topic.incidence,
+      difficulty: topic.difficulty,
+      needsReview: topic.needsReview,
+      priorityScore: topic.priorityScore,
+      priorityColor: topic.priorityColor,
+      completionDate: topic.completionDate,
+      history: topic.history.map((entry) => ({ ...entry })),
+      isAssigned: topic.isAssigned ?? false
+    }))
+  })),
+  calendar: calendar.map((entry) => serializeCalendarEntry(entry)),
+  lastUpdated: new Date().toISOString(),
+  version: '1.0.0'
+});
+
 export const loadStateSync = (): AppState => {
   try {
     const serializedState = localStorage.getItem(STORAGE_KEY);
     if (serializedState === null) {
       return INITIAL_APP_STATE;
     }
-    
+
     const parsedState = JSON.parse(serializedState);
+    const calendar = Array.isArray(parsedState.calendar)
+      ? (parsedState.calendar as FirestoreCalendarEntry[]).map((entry) => ensureCalendarEntry(entry))
+      : INITIAL_APP_STATE.calendar;
+    const disciplines = Array.isArray(parsedState.disciplines)
+      ? (parsedState.disciplines as FirestoreDiscipline[]).map((discipline) => ensureDiscipline(discipline))
+      : INITIAL_APP_STATE.disciplines;
+
     return {
       ...parsedState,
+      disciplines,
+      calendar,
       settings: {
         ...INITIAL_APP_STATE.settings,
         ...parsedState.settings,
       }
     };
   } catch (error) {
-    console.error("Could not load state synchronously", error);
+    console.error('Could not load state synchronously', error);
     return INITIAL_APP_STATE;
   }
 };
 
-// Load state with Firestore integration
-export const loadState = async (): Promise<AppState> => {
+export const loadState = async (userId?: string): Promise<AppState> => {
   try {
-    // First try to load from Firestore
-    const firestoreConfig = await loadGioConfigFromFirestore();
-    
-    if (firestoreConfig) {
-      // Use Firestore data as the source of truth for disciplines
-      return {
-        ...INITIAL_APP_STATE,
-        disciplines: firestoreConfig.disciplines,
-        settings: {
-          ...INITIAL_APP_STATE.settings,
-          ...loadLocalSettings()
-        }
-      };
+    if (userId) {
+      const firestoreConfig = await loadGioConfigFromFirestore(userId);
+      if (firestoreConfig) {
+        return {
+          ...INITIAL_APP_STATE,
+          disciplines: firestoreConfig.disciplines.map((discipline) => ensureDiscipline(discipline)),
+          calendar: firestoreConfig.calendar.map((entry) => ensureCalendarEntry(entry)),
+          settings: {
+            ...INITIAL_APP_STATE.settings,
+            ...loadLocalSettings()
+          }
+        };
+      }
     }
-    
-    // Fallback to localStorage if Firestore is not available
+
     const serializedState = localStorage.getItem(STORAGE_KEY);
     if (serializedState === null) {
       return INITIAL_APP_STATE;
     }
-    
+
     const parsedState = JSON.parse(serializedState);
     return {
       ...parsedState,
+      disciplines: Array.isArray(parsedState.disciplines)
+        ? (parsedState.disciplines as FirestoreDiscipline[]).map((discipline) => ensureDiscipline(discipline))
+        : INITIAL_APP_STATE.disciplines,
+      calendar: Array.isArray(parsedState.calendar)
+        ? (parsedState.calendar as FirestoreCalendarEntry[]).map((entry) => ensureCalendarEntry(entry))
+        : INITIAL_APP_STATE.calendar,
       settings: {
         ...INITIAL_APP_STATE.settings,
         ...parsedState.settings,
       }
     };
   } catch (error) {
-    console.error("Could not load state", error);
+    console.error('Could not load state', error);
     return INITIAL_APP_STATE;
   }
 };
 
-// Save state with Firestore integration
-export const saveState = async (state: AppState): Promise<void> => {
+export const saveState = async (userId: string | null, state: AppState): Promise<void> => {
   try {
-    // Save disciplines to Firestore
-    const gioConfig: GioConfig = {
-      disciplines: state.disciplines,
-      lastUpdated: new Date().toISOString(),
-      version: '1.0.0'
-    };
-    
-    await saveGioConfigToFirestore(gioConfig);
-    
-    // Save settings to localStorage (user-specific)
+    if (userId) {
+      await saveGioConfigToFirestore(userId, toFirestorePayload(state.disciplines, state.calendar));
+    }
     saveLocalSettings(state.settings);
-    
   } catch (error) {
-    console.error("Could not save state", error);
-    
-    // Fallback to localStorage if Firestore fails
+    console.error('Could not save state', error);
     try {
       const serializedState = JSON.stringify(state);
       localStorage.setItem(STORAGE_KEY, serializedState);
     } catch (localError) {
-      console.error("Could not save state to localStorage either", localError);
+      console.error('Could not save state to localStorage either', localError);
     }
   }
 };
 
-// Helper to load only settings from localStorage
 const loadLocalSettings = (): Partial<AppState['settings']> => {
   try {
     const serializedState = localStorage.getItem(STORAGE_KEY);
@@ -102,43 +202,34 @@ const loadLocalSettings = (): Partial<AppState['settings']> => {
       return parsedState.settings || {};
     }
   } catch (error) {
-    console.error("Could not load settings from localStorage", error);
+    console.error('Could not load settings from localStorage', error);
   }
   return {};
 };
 
-// Helper to save only settings to localStorage
 const saveLocalSettings = (settings: AppState['settings']): void => {
   try {
     const currentState = localStorage.getItem(STORAGE_KEY);
-    let stateToSave = currentState ? JSON.parse(currentState) : {};
-    
+    const stateToSave = currentState ? JSON.parse(currentState) : {};
     stateToSave.settings = settings;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
   } catch (error) {
-    console.error("Could not save settings to localStorage", error);
+    console.error('Could not save settings to localStorage', error);
   }
 };
 
-// Initialize Firestore with default data if empty
-export const initializeFirestoreWithDefaultData = async (): Promise<boolean> => {
+export const initializeFirestoreWithDefaultData = async (userId: string): Promise<boolean> => {
   try {
-    const existingConfig = await loadGioConfigFromFirestore();
-    
+    const existingConfig = await loadGioConfigFromFirestore(userId);
     if (!existingConfig) {
-      // No data in Firestore, upload default configuration
-      const gioConfig: GioConfig = {
-        disciplines: INITIAL_APP_STATE.disciplines,
-        lastUpdated: new Date().toISOString(),
-        version: '1.0.0'
-      };
-      
-      return await saveGioConfigToFirestore(gioConfig);
+      return await saveGioConfigToFirestore(
+        userId,
+        toFirestorePayload(INITIAL_APP_STATE.disciplines, INITIAL_APP_STATE.calendar)
+      );
     }
-    
-    return true; // Data already exists
+    return true;
   } catch (error) {
-    console.error("Could not initialize Firestore with default data", error);
+    console.error('Could not initialize Firestore with default data', error);
     return false;
   }
 };

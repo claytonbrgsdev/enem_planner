@@ -23,6 +23,7 @@ export const INITIAL_APP_STATE: AppState = {
   },
   disciplines: [],
   plans: {},
+  calendar: [],
   showSplashScreen: true,
   lastReorganized: null,
 };

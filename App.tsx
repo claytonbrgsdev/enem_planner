@@ -7,13 +7,29 @@ import {
   saveGioConfigToFirestore,
   type FirestoreDiscipline,
   type FirestoreTopic,
+  type FirestoreCalendarEntry,
   type GioConfig
 } from './services/firestoreService';
-import { authenticateAnonymously, onAuthChange, isAuthenticated } from './services/firebase';
+import { initializeFirestoreWithDefaultData } from './services/storageService';
+import {
+  onAuthChange,
+  registerWithEmail,
+  signInWithEmail,
+  signOutUser,
+  getCurrentUser
+} from './services/firebase';
+import type { User } from 'firebase/auth';
+import { FirebaseError } from 'firebase/app';
+import type {
+  Discipline as DomainDiscipline,
+  StudyTopic as DomainStudyTopic,
+  PriorityColor as DomainPriorityColor,
+  CalendarEntry as DomainCalendarEntry
+} from './types';
 
 type TabId = 'today' | 'calendar' | 'settings';
 
-type PriorityColor = 'green' | 'yellow' | 'red';
+type PriorityColor = DomainPriorityColor;
 
 type CompletionContext = {
   slotId: string;
@@ -40,22 +56,31 @@ type StudySlot = {
   assignedTopic?: AssignedTopic;
 };
 
-type StudyTopic = FirestoreTopic;
+type StudyTopic = DomainStudyTopic;
 
-type Discipline = FirestoreDiscipline;
+type Discipline = DomainDiscipline;
+
+type CalendarEntry = DomainCalendarEntry;
 
 type ReviewItem = {
   id: string;
   title: string;
   scheduled: string;
+  time: string;
   status: 'due' | 'done' | 'upcoming';
+  disciplineId: string;
+  topicId: string;
+  dueDate: string;
+  sequence: number;
 };
 
 type CalendarDay = {
   type: 'day' | 'pad';
+  date?: string;
   dayNumber?: number;
   status?: 'rest' | 'study' | 'review' | 'mixed';
   description?: string;
+  events?: CalendarEntry[];
 };
 
 type ModalProps = {
@@ -81,6 +106,18 @@ type DraggedTopicPayload = {
   sourceSlotId?: string;
 };
 
+type CopiedTopicPayload = {
+  disciplineId: string;
+  topicId: string;
+  title: string;
+  disciplineName: string;
+  incidence: number;
+  difficulty: number;
+  needsReview: boolean;
+  priorityScore: number;
+  priorityColor: PriorityColor;
+};
+
 const TABS: Array<{ id: TabId; label: string }> = [
   { id: 'today', label: 'Hoje' },
   { id: 'calendar', label: 'Calendário' },
@@ -93,6 +130,9 @@ const INITIAL_STUDY_SLOTS: StudySlot[] = [
   { id: 'slot-3', label: 'Noite' },
   { id: 'slot-4', label: 'Extra' }
 ];
+
+const REVIEW_CADENCE = [1, 3, 7];
+const REVIEW_TIMES = ['08:00', '14:00', '20:00'];
 
 const createId = (prefix: string): string => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -116,6 +156,18 @@ const calculatePriority = (
   if (score <= 6) return { score, color: 'green' };
   if (score <= 12) return { score, color: 'yellow' };
   return { score, color: 'red' };
+};
+
+const toDateOnlyString = (value: Date | string): string => {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString().split('T')[0];
+};
+
+const addDays = (date: Date, days: number): Date => {
+  const result = new Date(date);
+  result.setDate(result.getDate() + days);
+  return result;
 };
 
 const priorityLabel: Record<PriorityColor, string> = {
@@ -170,7 +222,7 @@ const ensureTopicShape = (disciplineId: string, topic: Partial<FirestoreTopic>):
     ? topic!.history.map((entry) => ({
         date: entry?.date ?? new Date().toISOString(),
         notes: entry?.notes ?? '',
-        type: entry?.type === 'review' ? 'review' : 'study'
+        type: entry?.type === 'review' ? 'review' as const : 'study' as const
       }))
     : [];
 
@@ -208,17 +260,202 @@ const ensureDisciplineShape = (discipline: Partial<FirestoreDiscipline>): Discip
   };
 };
 
-const toFirestorePayload = (input: Discipline[]): GioConfig => ({
+const ensureCalendarEntryShape = (entry: Partial<FirestoreCalendarEntry>): CalendarEntry => {
+  const fallbackTimestamp = new Date().toISOString();
+  const timestamp = typeof entry.timestamp === 'string' && entry.timestamp
+    ? entry.timestamp
+    : entry.date
+      ? new Date(`${entry.date}T00:00:00.000Z`).toISOString()
+      : fallbackTimestamp;
+
+  const normalizedDate = toDateOnlyString(timestamp) || toDateOnlyString(fallbackTimestamp);
+
+  return {
+    id: entry.id ?? createId('calendar-entry'),
+    date: normalizedDate,
+    timestamp,
+    type: entry.type === 'review' ? 'review' : 'study',
+    title: entry.title ?? 'Atividade registrada',
+    disciplineId: entry.disciplineId ?? '',
+    disciplineName: entry.disciplineName ?? '',
+    topicId: entry.topicId ?? '',
+    notes: entry.notes ?? undefined,
+    reviewSequence: typeof entry.reviewSequence === 'number' ? entry.reviewSequence : undefined
+  };
+};
+
+const sortCalendarEntries = (entries: CalendarEntry[]): CalendarEntry[] =>
+  [...entries].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    const timeCompare = a.timestamp.localeCompare(b.timestamp);
+    if (timeCompare !== 0) return timeCompare;
+    return a.id.localeCompare(b.id);
+  });
+
+const parseDateOnly = (value: string): Date | null => {
+  if (!value || typeof value !== 'string') return null;
+  const parts = value.split('-').map((part) => Number.parseInt(part, 10));
+  if (parts.length !== 3 || parts.some((part) => Number.isNaN(part))) {
+    return null;
+  }
+  const [year, month, day] = parts;
+  return new Date(year, month - 1, day);
+};
+
+const formatDateOnly = (year: number, monthIndex: number, day: number): string => {
+  const paddedMonth = String(monthIndex + 1).padStart(2, '0');
+  const paddedDay = String(day).padStart(2, '0');
+  return `${year}-${paddedMonth}-${paddedDay}`;
+};
+
+const getCalendarDayStatus = (events: CalendarEntry[]): CalendarDay['status'] => {
+  if (events.length === 0) return undefined;
+  const hasStudy = events.some((event) => event.type === 'study');
+  const hasReview = events.some((event) => event.type === 'review');
+  if (hasStudy && hasReview) return 'mixed';
+  if (hasStudy) return 'study';
+  if (hasReview) return 'review';
+  return undefined;
+};
+
+const summarizeCalendarEvents = (events: CalendarEntry[]): string | undefined => {
+  if (events.length === 0) return undefined;
+  const studyCount = events.filter((event) => event.type === 'study').length;
+  const reviewCount = events.filter((event) => event.type === 'review').length;
+  const parts: string[] = [];
+  if (studyCount > 0) {
+    parts.push(`${studyCount} ${studyCount === 1 ? 'estudo' : 'estudos'}`);
+  }
+  if (reviewCount > 0) {
+    parts.push(`${reviewCount} ${reviewCount === 1 ? 'revisão' : 'revisões'}`);
+  }
+  return parts.join(' · ');
+};
+
+const isTopicCompleted = (topic: StudyTopic): boolean => Boolean(topic.completionDate);
+
+const getDisciplineProgress = (discipline: Discipline) => {
+  const total = discipline.topics.length;
+  const completed = discipline.topics.reduce((acc, topic) => acc + (isTopicCompleted(topic) ? 1 : 0), 0);
+  const pending = total - completed;
+  const percentage = total === 0 ? 0 : Math.round((completed / total) * 100);
+  return { total, completed, pending, percentage };
+};
+
+const getOverallProgress = (disciplines: Discipline[]) => {
+  const aggregate = disciplines.reduce(
+    (acc, discipline) => {
+      const progress = getDisciplineProgress(discipline);
+      return {
+        total: acc.total + progress.total,
+        completed: acc.completed + progress.completed,
+        pending: acc.pending + progress.pending
+      };
+    },
+    { total: 0, completed: 0, pending: 0 }
+  );
+  const percentage = aggregate.total === 0 ? 0 : Math.round((aggregate.completed / aggregate.total) * 100);
+  return { ...aggregate, percentage };
+};
+
+const buildReviewItems = (disciplines: Discipline[], todayKey: string, cadence: number[]): ReviewItem[] => {
+  const reviewItems: ReviewItem[] = [];
+
+  disciplines.forEach((discipline) => {
+    discipline.topics.forEach((topic) => {
+      if (!topic.needsReview) return;
+      const studyHistory = topic.history
+        .filter((entry) => entry.type === 'study')
+        .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+      if (studyHistory.length === 0) return;
+
+      const lastStudyEntry = studyHistory[studyHistory.length - 1];
+      const lastStudyDate = new Date(lastStudyEntry.date);
+      if (Number.isNaN(lastStudyDate.getTime())) return;
+
+      const reviewHistory = new Set(
+        topic.history
+          .filter((entry) => entry.type === 'review')
+          .map((entry) => toDateOnlyString(entry.date))
+      );
+
+      for (let index = 0; index < cadence.length; index += 1) {
+        const offset = cadence[index]!;
+        const dueDate = addDays(lastStudyDate, offset);
+        const dueKey = toDateOnlyString(dueDate);
+        if (!dueKey) {
+          continue;
+        }
+
+        if (reviewHistory.has(dueKey)) {
+          continue;
+        }
+
+        const status: ReviewItem['status'] = dueKey <= todayKey ? 'due' : 'upcoming';
+        const time = REVIEW_TIMES[index % REVIEW_TIMES.length];
+        const scheduledLabel = dueKey === todayKey ? `Hoje · ${time}` : `${dueKey} · ${time}`;
+
+        reviewItems.push({
+          id: `${topic.id}-review-${offset}`,
+          title: topic.name,
+          scheduled: scheduledLabel,
+          time,
+          status,
+          disciplineId: discipline.id,
+          topicId: topic.id,
+          dueDate: dueKey,
+          sequence: index + 1
+        });
+        break;
+      }
+    });
+  });
+
+  reviewItems.sort((a, b) => {
+    const dateCompare = a.dueDate.localeCompare(b.dueDate);
+    if (dateCompare !== 0) return dateCompare;
+    return a.sequence - b.sequence;
+  });
+
+  return reviewItems;
+};
+
+const serializeCalendarEntry = (entry: CalendarEntry): FirestoreCalendarEntry => {
+  const payload: FirestoreCalendarEntry = {
+    id: entry.id,
+    date: entry.date,
+    timestamp: entry.timestamp,
+    type: entry.type,
+    title: entry.title,
+    disciplineId: entry.disciplineId,
+    disciplineName: entry.disciplineName,
+    topicId: entry.topicId
+  };
+
+  if (entry.notes && entry.notes.trim().length > 0) {
+    payload.notes = entry.notes.trim();
+  }
+  if (typeof entry.reviewSequence === 'number') {
+    payload.reviewSequence = entry.reviewSequence;
+  }
+
+  return payload;
+};
+
+const toFirestorePayload = (input: Discipline[], calendar: CalendarEntry[]): GioConfig => ({
   disciplines: input.map((discipline) => ({
     ...discipline,
     pending: computePendingCount(discipline.topics),
     topics: discipline.topics.map((topic) => ({ ...topic }))
   })),
+  calendar: calendar.map((entry) => serializeCalendarEntry(entry)),
   lastUpdated: new Date().toISOString(),
   version: '1.0.0'
 });
 
-const extractDisciplinesFromJson = (data: unknown): Discipline[] => {
+const extractConfigFromJson = (data: unknown): { disciplines: Discipline[]; calendar: CalendarEntry[] } => {
   const candidates = Array.isArray(data)
     ? data
     : Array.isArray((data as any)?.disciplines)
@@ -229,9 +466,19 @@ const extractDisciplinesFromJson = (data: unknown): Discipline[] => {
     throw new Error('Formato inválido: esperado "disciplines" ou lista de disciplinas.');
   }
 
-  return (candidates as Array<Partial<FirestoreDiscipline>>).map((discipline) =>
+  const normalizedDisciplines = (candidates as Array<Partial<FirestoreDiscipline>>).map((discipline) =>
     ensureDisciplineShape(discipline)
   );
+
+  const calendarCandidates = Array.isArray((data as any)?.calendar) ? (data as any).calendar : [];
+  const normalizedCalendar = (calendarCandidates as Array<Partial<FirestoreCalendarEntry>>).map((entry) =>
+    ensureCalendarEntryShape(entry)
+  );
+
+  return {
+    disciplines: normalizedDisciplines,
+    calendar: sortCalendarEntries(normalizedCalendar)
+  };
 };
 
 const INITIAL_DISCIPLINES: Discipline[] = [
@@ -275,12 +522,6 @@ const INITIAL_DISCIPLINES: Discipline[] = [
       pending: computePendingCount(topics)
     };
   })()
-];
-
-const REVIEWS: ReviewItem[] = [
-  { id: 'rev-1', title: 'Revisar Termodinâmica', scheduled: '08:00', status: 'due' },
-  { id: 'rev-2', title: 'Resumo de Biologia Celular', scheduled: '14:00', status: 'upcoming' },
-  { id: 'rev-3', title: 'Flashcards de Literatura', scheduled: '20:00', status: 'upcoming' }
 ];
 
 const STATUS_LABEL: Record<NonNullable<CalendarDay['status']>, string> = {
@@ -354,6 +595,137 @@ const ClockPanel: React.FC = () => {
   );
 };
 
+const PomodoroTimer: React.FC = () => {
+  const [timeLeft, setTimeLeft] = useState(25 * 60); // 25 minutos em segundos
+  const [isRunning, setIsRunning] = useState(false);
+  const [isWorkSession, setIsWorkSession] = useState(true);
+  const [completedSessions, setCompletedSessions] = useState(0);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  const WORK_TIME = 25 * 60; // 25 minutos
+  const SHORT_BREAK = 5 * 60; // 5 minutos
+  const LONG_BREAK = 15 * 60; // 15 minutos
+
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const startTimer = () => {
+    if (!isRunning) {
+      setIsRunning(true);
+      intervalRef.current = setInterval(() => {
+        setTimeLeft((prev) => {
+          if (prev <= 1) {
+            setIsRunning(false);
+            // Alternar entre trabalho e pausa
+            if (isWorkSession) {
+              setIsWorkSession(false);
+              setCompletedSessions(prevSessions => prevSessions + 1);
+              // Pausa longa a cada 4 sessões de trabalho
+              const nextBreakTime = (completedSessions + 1) % 4 === 0 ? LONG_BREAK : SHORT_BREAK;
+              return nextBreakTime;
+            } else {
+              setIsWorkSession(true);
+              return WORK_TIME;
+            }
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+  };
+
+  const pauseTimer = () => {
+    setIsRunning(false);
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  };
+
+  const resetTimer = () => {
+    setIsRunning(false);
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    setIsWorkSession(true);
+    setTimeLeft(WORK_TIME);
+    // Não resetar completedSessions para manter o histórico
+  };
+
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, []);
+
+  const getSessionText = () => {
+    if (isWorkSession) return 'Foco';
+    const isLongBreak = completedSessions > 0 && completedSessions % 4 === 0;
+    return isLongBreak ? 'Pausa Longa' : 'Pausa Curta';
+  };
+
+  const getProgressPercentage = () => {
+    let totalTime;
+    if (isWorkSession) {
+      totalTime = WORK_TIME;
+    } else {
+      totalTime = completedSessions > 0 && completedSessions % 4 === 0 ? LONG_BREAK : SHORT_BREAK;
+    }
+    return ((totalTime - timeLeft) / totalTime) * 100;
+  };
+
+  return (
+    <div className="header-card pomodoro-card">
+      <div className="pomodoro-header">
+        <h3 className="pomodoro-title">{getSessionText()}</h3>
+        <span className="pomodoro-subtitle">
+          {isWorkSession ? 'Tempo de estudo' : 'Tempo de descanso'}
+        </span>
+        {completedSessions > 0 && (
+          <div className="pomodoro-sessions">
+            <small>Sessões: {completedSessions}</small>
+          </div>
+        )}
+      </div>
+
+      <div className="pomodoro-timer">
+        <div className="pomodoro-display">
+          {formatTime(timeLeft)}
+        </div>
+        <div className="pomodoro-progress">
+          <div
+            className="pomodoro-progress-bar"
+            style={{ width: `${getProgressPercentage()}%` }}
+          />
+        </div>
+      </div>
+
+      <div className="pomodoro-controls">
+        <button
+          type="button"
+          className="ghost-button pomodoro-button"
+          onClick={isRunning ? pauseTimer : startTimer}
+        >
+          {isRunning ? 'Pausar' : 'Iniciar'}
+        </button>
+        <button
+          type="button"
+          className="ghost-button pomodoro-button"
+          onClick={resetTimer}
+        >
+          Resetar
+        </button>
+      </div>
+    </div>
+  );
+};
+
 const MediaSlot: React.FC = () => (
   <div className="header-card media-card">
     <video className="media-video" autoPlay loop muted playsInline aria-label="Ambiente visual">
@@ -382,6 +754,7 @@ const StudySlotColumn: React.FC<{
   slots: StudySlot[];
   draggedTopic: DraggedTopicPayload | null;
   activeDropSlot: string | null;
+  copiedTopic: CopiedTopicPayload | null;
   onOpenCompletion: (slotId: string, topic: AssignedTopic) => void;
   onDropTopic: (slotId: string) => void;
   onDragOverSlot: (slotId: string) => void;
@@ -389,24 +762,27 @@ const StudySlotColumn: React.FC<{
   onSlotTopicDragStart: (event: React.DragEvent<HTMLElement>, slotId: string, topic: AssignedTopic) => void;
   onSlotTopicDragEnd: (event: React.DragEvent<HTMLElement>) => void;
   onRemoveTopic: (slotId: string) => void;
+  onPasteCopiedTopic: (slotId: string) => void;
 }> = ({
   slots,
   draggedTopic,
   activeDropSlot,
+  copiedTopic,
   onOpenCompletion,
   onDropTopic,
   onDragOverSlot,
   onDragLeaveSlot,
   onSlotTopicDragStart,
   onSlotTopicDragEnd,
-  onRemoveTopic
+  onRemoveTopic,
+  onPasteCopiedTopic
 }) => (
   <section className="panel">
     <header className="panel-header">
       <h2>Plano de hoje</h2>
-      <p>Arraste tópicos para preencher cada slot.</p>
+      <p>Arraste tópicos ou cole o que estiver copiado.</p>
     </header>
-    <div className="study-slots">
+    <div className="panel-scroll-area study-slots">
       {slots.map((slot) => {
         const hasAssignment = Boolean(slot.assignedTopic);
         const isOriginSlot = draggedTopic?.source === 'slot' && draggedTopic.sourceSlotId === slot.id;
@@ -496,11 +872,28 @@ const StudySlotColumn: React.FC<{
                     Remover do plano
                   </button>
                 </div>
+                {copiedTopic && (
+                  <button type="button" className="ghost-button study-slot__paste" disabled>
+                    Libere o slot para colar
+                  </button>
+                )}
               </div>
             ) : (
               <div className="study-slot__empty">
                 <span>Disponível</span>
-                <small>Arraste um tópico para cá</small>
+                <small>{copiedTopic ? 'Clique no botão para colar ou arraste um tópico' : 'Arraste um tópico para cá'}</small>
+                {copiedTopic && (
+                  <button
+                    type="button"
+                    className="ghost-button study-slot__paste"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onPasteCopiedTopic(slot.id);
+                    }}
+                  >
+                    Colar {copiedTopic.title}
+                  </button>
+                )}
               </div>
             )}
           </article>
@@ -514,18 +907,22 @@ const DisciplineAccordion: React.FC<{
   disciplines: Discipline[];
   expandedId: string | null;
   draggedTopic: DraggedTopicPayload | null;
+  copiedTopic: CopiedTopicPayload | null;
   onToggle: (id: string) => void;
   onTopicDragStart: (event: React.DragEvent<HTMLElement>, disciplineId: string, topicId: string) => void;
   onTopicDragEnd: (event: React.DragEvent<HTMLElement>) => void;
-}> = ({ disciplines, expandedId, draggedTopic, onToggle, onTopicDragStart, onTopicDragEnd }) => (
+  onCopyTopic: (disciplineId: string, topicId: string) => void;
+}> = ({ disciplines, expandedId, draggedTopic, copiedTopic, onToggle, onTopicDragStart, onTopicDragEnd, onCopyTopic }) => (
   <section className="panel">
     <header className="panel-header">
       <h2>Disciplinas e tópicos</h2>
       <p>Prioridades calculadas automaticamente.</p>
     </header>
-    <div className="accordion">
+    <div className="panel-scroll-area accordion-scroll">
+      <div className="accordion">
       {disciplines.map((discipline) => {
         const isExpanded = expandedId === discipline.id;
+        const progress = getDisciplineProgress(discipline);
         return (
           <div key={discipline.id} className="accordion-item">
             <button
@@ -536,7 +933,9 @@ const DisciplineAccordion: React.FC<{
             >
               <div>
                 <h3>{discipline.name}</h3>
-                <small>{discipline.pending} tópicos pendentes · Peso {discipline.weight}</small>
+                <small>
+                  {progress.completed} de {progress.total} concluídos · {progress.pending} pendentes · Peso {discipline.weight}
+                </small>
               </div>
               <span aria-hidden="true">{isExpanded ? '−' : '+'}</span>
             </button>
@@ -545,11 +944,13 @@ const DisciplineAccordion: React.FC<{
                 {discipline.topics.map((topic) => {
                   const isAssigned = Boolean(topic.isAssigned);
                   const isDragging = draggedTopic?.topicId === topic.id;
+                  const isCopied = copiedTopic?.topicId === topic.id;
                   const classes = [
                     'topic-card',
                     priorityClass[topic.priorityColor],
                     isAssigned ? 'is-disabled' : '',
-                    isDragging ? 'is-dragging' : ''
+                    isDragging ? 'is-dragging' : '',
+                    isCopied ? 'is-copied' : ''
                   ].filter(Boolean).join(' ');
 
                   return (
@@ -565,12 +966,23 @@ const DisciplineAccordion: React.FC<{
                         <span className="topic-focus">Pontuação {topic.priorityScore}</span>
                         <span className="topic-priority">{priorityLabel[topic.priorityColor]}</span>
                       </div>
+                      <div className={topic.completionDate ? 'topic-card__badges topic-card--completed' : 'topic-card__badges'}>
+                        <span className={`priority-tag priority-${topic.priorityColor}`}>
+                          {priorityLabel[topic.priorityColor]}
+                        </span>
+                        {isTopicCompleted(topic) && <span className="topic-card__check">✓ Concluído</span>}
+                      </div>
                       <h4>{topic.name}</h4>
                       <p>
                         Incidência {topic.incidence} · Dificuldade {topic.difficulty} · Revisão {topic.needsReview ? 'Sim' : 'Não'}
                       </p>
-                      <button type="button" className="ghost-button" disabled={isAssigned}>
-                        {isAssigned ? 'Já adicionado ao plano' : 'Arraste para o plano'}
+                      <button
+                        type="button"
+                        className={isCopied ? 'ghost-button copy-button is-active' : 'ghost-button copy-button'}
+                        onClick={() => onCopyTopic(discipline.id, topic.id)}
+                        disabled={isAssigned}
+                      >
+                        {isCopied ? 'Copiado · clique em um slot' : 'Copiar para colar'}
                       </button>
                     </article>
                   );
@@ -580,44 +992,58 @@ const DisciplineAccordion: React.FC<{
           </div>
         );
       })}
+      </div>
     </div>
   </section>
 );
 
-const ReviewColumn: React.FC<{ onOpenDecision: () => void }> = ({ onOpenDecision }) => (
+const ReviewColumn: React.FC<{ reviews: ReviewItem[]; onOpenDecision: (review: ReviewItem) => void }> = ({ reviews, onOpenDecision }) => (
   <section className="panel">
     <header className="panel-header">
       <h2>Revisões do dia</h2>
       <p>Geradas automaticamente pelo algoritmo.</p>
     </header>
-    <ul className="review-list">
-      {REVIEWS.map((review) => (
-        <li key={review.id} className={`review-card review-${review.status}`}>
-          <div>
-            <h3>{review.title}</h3>
-            <small>{review.scheduled}</small>
-          </div>
-          <button type="button" className="outline-button" onClick={onOpenDecision}>
-            Marcar revisão
-          </button>
-        </li>
-      ))}
-    </ul>
+    <div className="panel-scroll-area">
+      {reviews.length === 0 ? (
+        <p className="empty-hint">Nenhuma revisão pendente.</p>
+      ) : (
+        <ul className="review-list">
+          {reviews.map((review) => (
+            <li key={review.id} className={`review-card review-${review.status}`}>
+              <div>
+                <h3>{review.title}</h3>
+                <small>{review.scheduled}</small>
+              </div>
+              <button
+                type="button"
+                className="outline-button"
+                onClick={() => onOpenDecision(review)}
+                disabled={review.status === 'done'}
+              >
+                Marcar revisão
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   </section>
 );
 
 const TodayView: React.FC<{
   disciplines: Discipline[];
   studySlots: StudySlot[];
+  reviews: ReviewItem[];
   expandedDiscipline: string | null;
   draggedTopic: DraggedTopicPayload | null;
   activeDropSlot: string | null;
+  copiedTopic: CopiedTopicPayload | null;
   dragFeedback: string | null;
   onToggleDiscipline: (id: string) => void;
   onTopicDragStart: (event: React.DragEvent<HTMLElement>, disciplineId: string, topicId: string) => void;
   onTopicDragEnd: (event: React.DragEvent<HTMLElement>) => void;
   onOpenCompletion: (slotId: string, topic: AssignedTopic) => void;
-  onOpenDecision: () => void;
+  onOpenDecision: (review: ReviewItem) => void;
   onDropTopic: (slotId: string) => void;
   onDragOverSlot: (slotId: string) => void;
   onDragLeaveSlot: (slotId: string) => void;
@@ -627,13 +1053,18 @@ const TodayView: React.FC<{
   onRemovalDragEnter: (event: React.DragEvent<HTMLDivElement>) => void;
   onRemovalDragLeave: (event: React.DragEvent<HTMLDivElement>) => void;
   onRemovalDrop: (event: React.DragEvent<HTMLDivElement>) => void;
+  onCopyTopic: (disciplineId: string, topicId: string) => void;
+  onPasteCopiedTopic: (slotId: string) => void;
+  onClearCopiedTopic: () => void;
   isRemovalHover: boolean;
 }> = ({
   disciplines,
   studySlots,
+  reviews,
   expandedDiscipline,
   draggedTopic,
   activeDropSlot,
+  copiedTopic,
   dragFeedback,
   onToggleDiscipline,
   onTopicDragStart,
@@ -649,15 +1080,29 @@ const TodayView: React.FC<{
   onRemovalDragEnter,
   onRemovalDragLeave,
   onRemovalDrop,
+  onCopyTopic,
+  onPasteCopiedTopic,
+  onClearCopiedTopic,
   isRemovalHover
 }) => (
   <div className="today-view">
+    {copiedTopic && (
+      <div className="clipboard-banner" role="status">
+        <span>
+          <strong>{copiedTopic.title}</strong> copiado de {copiedTopic.disciplineName}. Clique em um slot vazio para colar.
+        </span>
+        <button type="button" className="ghost-button" onClick={onClearCopiedTopic}>
+          Cancelar cópia
+        </button>
+      </div>
+    )}
     {dragFeedback && <div className="drag-feedback" role="status">{dragFeedback}</div>}
     <div className="today-grid">
       <StudySlotColumn
         slots={studySlots}
         draggedTopic={draggedTopic}
         activeDropSlot={activeDropSlot}
+        copiedTopic={copiedTopic}
         onOpenCompletion={onOpenCompletion}
         onDropTopic={onDropTopic}
         onDragOverSlot={onDragOverSlot}
@@ -665,16 +1110,19 @@ const TodayView: React.FC<{
         onSlotTopicDragStart={onSlotTopicDragStart}
         onSlotTopicDragEnd={onSlotTopicDragEnd}
         onRemoveTopic={onRemoveTopic}
+        onPasteCopiedTopic={onPasteCopiedTopic}
       />
       <DisciplineAccordion
         disciplines={disciplines}
         expandedId={expandedDiscipline}
         draggedTopic={draggedTopic}
+        copiedTopic={copiedTopic}
         onToggle={onToggleDiscipline}
         onTopicDragStart={onTopicDragStart}
         onTopicDragEnd={onTopicDragEnd}
+        onCopyTopic={onCopyTopic}
       />
-      <ReviewColumn onOpenDecision={onOpenDecision} />
+      <ReviewColumn reviews={reviews} onOpenDecision={onOpenDecision} />
     </div>
     {draggedTopic?.source === 'slot' && (
       <RemovalZone
@@ -706,11 +1154,16 @@ const CalendarView: React.FC<{
           return <span key={`pad-${index}`} className="calendar-day calendar-day--pad" />;
         }
         const statusClass = day.status ? `calendar-day status-${day.status}` : 'calendar-day';
+        const dayLabel = day.description
+          ? `Dia ${day.dayNumber}: ${day.description}`
+          : `Dia ${day.dayNumber}: sem registros`;
         return (
           <button
             key={`day-${day.dayNumber}`}
             type="button"
             className={statusClass}
+            title={dayLabel}
+            aria-label={dayLabel}
             onClick={() => onSelectDay(day)}
           >
             <span className="calendar-day__number">{day.dayNumber}</span>
@@ -719,6 +1172,94 @@ const CalendarView: React.FC<{
         );
       })}
     </div>
+  </div>
+);
+
+type AuthViewProps = {
+  mode: 'login' | 'register';
+  email: string;
+  password: string;
+  error: string | null;
+  isSubmitting: boolean;
+  onEmailChange: (value: string) => void;
+  onPasswordChange: (value: string) => void;
+  onSubmit: () => void;
+  onToggleMode: () => void;
+};
+
+const AuthView: React.FC<AuthViewProps> = ({
+  mode,
+  email,
+  password,
+  error,
+  isSubmitting,
+  onEmailChange,
+  onPasswordChange,
+  onSubmit,
+  onToggleMode
+}) => (
+  <div className="auth-shell">
+    <div className="auth-card">
+      <header className="auth-header">
+        <h1>GIO · Organizador de Estudos</h1>
+        <p>Mantenha seus dados sincronizados em qualquer dispositivo.</p>
+      </header>
+
+      <form
+        className="auth-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit();
+        }}
+      >
+        <label className="form-field">
+          <span>E-mail</span>
+          <input
+            type="email"
+            value={email}
+            autoComplete="email"
+            placeholder="voce@exemplo.com"
+            onChange={(event) => onEmailChange(event.target.value)}
+            required
+          />
+        </label>
+
+        <label className="form-field">
+          <span>Senha</span>
+          <input
+            type="password"
+            value={password}
+            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+            placeholder="••••••••"
+            onChange={(event) => onPasswordChange(event.target.value)}
+            minLength={6}
+            required
+          />
+        </label>
+
+        {error && <p className="auth-error" role="alert">{error}</p>}
+
+        <button type="submit" className="primary-button" disabled={isSubmitting}>
+          {isSubmitting ? 'Processando...' : mode === 'login' ? 'Entrar' : 'Criar conta'}
+        </button>
+      </form>
+
+      <footer className="auth-footer">
+        <span>{mode === 'login' ? 'Ainda não tem conta?' : 'Já possui conta?'}</span>
+        <button type="button" className="ghost-button" onClick={onToggleMode} disabled={isSubmitting}>
+          {mode === 'login' ? 'Criar uma conta' : 'Fazer login'}
+        </button>
+      </footer>
+    </div>
+  </div>
+);
+
+const UserBar: React.FC<{ email: string; onSignOut: () => void; disabled?: boolean }> = ({ email, onSignOut, disabled }) => (
+  <div className="user-bar">
+    <span>{email}</span>
+    <button type="button" className="ghost-button" onClick={onSignOut} disabled={disabled}>
+      Sair
+    </button>
   </div>
 );
 
@@ -733,6 +1274,7 @@ type SettingsViewProps = {
     field: 'name' | 'incidence' | 'difficulty' | 'needsReview',
     value: string | number | boolean
   ) => void;
+  onRemoveTopic: (disciplineId: string, topicId: string) => void;
   onExport: () => void;
   onCopyTemplate: () => void;
   onImportFile: (file: File) => void;
@@ -746,6 +1288,7 @@ const SettingsView: React.FC<SettingsViewProps> = ({
   onUpdateDisciplineField,
   onAddTopic,
   onUpdateTopicField,
+  onRemoveTopic,
   onExport,
   onCopyTemplate,
   onImportFile,
@@ -834,9 +1377,13 @@ const SettingsView: React.FC<SettingsViewProps> = ({
                     <span>Dificuldade</span>
                     <span>Revisão?</span>
                     <span>Prioridade</span>
+                    <span>Ações</span>
                   </div>
                   {discipline.topics.map((topic) => (
-                    <div key={topic.id} className="topic-row">
+                    <div
+                      key={topic.id}
+                      className={topic.completionDate ? 'topic-row topic-row--completed' : 'topic-row'}
+                    >
                       <input
                         type="text"
                         value={topic.name}
@@ -896,11 +1443,25 @@ const SettingsView: React.FC<SettingsViewProps> = ({
                         </span>
                         <small>Pontuação {topic.priorityScore}</small>
                       </div>
+                      {topic.completionDate && (
+                        <div className="topic-card__check">
+                          ✓ Concluído
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => onRemoveTopic(discipline.id, topic.id)}
+                        disabled={isPersisting}
+                        title="Remover tópico"
+                      >
+                        Remover
+                      </button>
                     </div>
                   ))}
                 </div>
               )}
-            </article>
+          </article>
           ))}
         </div>
       </section>
@@ -967,43 +1528,59 @@ const SettingsView: React.FC<SettingsViewProps> = ({
   );
 };
 
-const generateCalendarDays = (): CalendarDay[] => {
-  const reference = new Date();
-  const year = reference.getFullYear();
-  const month = reference.getMonth();
+const generateCalendarDays = (entries: CalendarEntry[], referenceKey: string): CalendarDay[] => {
+  const referenceDate = parseDateOnly(referenceKey) ?? new Date();
+  const year = referenceDate.getFullYear();
+  const month = referenceDate.getMonth();
   const firstDay = new Date(year, month, 1);
   const offset = firstDay.getDay();
   const totalDays = new Date(year, month + 1, 0).getDate();
-  const highlights: Record<number, CalendarDay['status']> = {
-    2: 'study',
-    5: 'rest',
-    7: 'review',
-    10: 'mixed',
-    16: 'study',
-    21: 'mixed',
-    25: 'review',
-    28: 'study'
-  };
+
+  const eventsByDay = entries.reduce((acc, entry) => {
+    const parsed = parseDateOnly(entry.date);
+    if (!parsed) return acc;
+    if (parsed.getFullYear() !== year || parsed.getMonth() !== month) return acc;
+    const dayNumber = parsed.getDate();
+    if (!acc[dayNumber]) {
+      acc[dayNumber] = [];
+    }
+    acc[dayNumber]!.push(entry);
+    return acc;
+  }, {} as Record<number, CalendarEntry[]>);
 
   const days: CalendarDay[] = [];
   for (let i = 0; i < offset; i += 1) {
     days.push({ type: 'pad' });
   }
+
   for (let day = 1; day <= totalDays; day += 1) {
+    const dayEvents = sortCalendarEntries(eventsByDay[day] ?? []);
+    const status = getCalendarDayStatus(dayEvents);
     days.push({
       type: 'day',
       dayNumber: day,
-      status: highlights[day],
-      description: highlights[day] ? STATUS_LABEL[highlights[day]!] : undefined
+      date: formatDateOnly(year, month, day),
+      status,
+      description: status ? summarizeCalendarEvents(dayEvents) : undefined,
+      events: dayEvents
     });
   }
+
   while (days.length % 7 !== 0) {
     days.push({ type: 'pad' });
   }
+
   return days;
 };
 
 const App: React.FC = () => {
+  const initialUser = typeof window === 'undefined' ? null : getCurrentUser();
+  const [currentUser, setCurrentUser] = useState<User | null>(initialUser);
+  const [authReady, setAuthReady] = useState(() => (typeof window === 'undefined' ? true : Boolean(initialUser)));
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authEmail, setAuthEmail] = useState(initialUser?.email ?? '');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>('today');
   const [studySlots, setStudySlots] = useState<StudySlot[]>(INITIAL_STUDY_SLOTS);
   const [disciplines, setDisciplines] = useState<Discipline[]>(INITIAL_DISCIPLINES);
@@ -1013,8 +1590,11 @@ const App: React.FC = () => {
   const dropHandledRef = useRef(false);
   const [activeDropSlot, setActiveDropSlot] = useState<string | null>(null);
   const [dragFeedback, setDragFeedback] = useState<string | null>(null);
+  const [copiedTopic, setCopiedTopic] = useState<CopiedTopicPayload | null>(null);
   const [isRemovalHover, setRemovalHover] = useState(false);
-  const [authReady, setAuthReady] = useState(() => (typeof window === 'undefined' ? true : isAuthenticated()));
+  const [today, setToday] = useState(() => toDateOnlyString(new Date()));
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [selectedReview, setSelectedReview] = useState<ReviewItem | null>(null);
   const [isLoadingDisciplines, setLoadingDisciplines] = useState(false);
   const [isPersisting, setIsPersisting] = useState(false);
   const [completionContext, setCompletionContext] = useState<CompletionContext | null>(null);
@@ -1023,45 +1603,130 @@ const App: React.FC = () => {
   const [isStudyModalOpen, setStudyModalOpen] = useState(false);
   const [isReviewModalOpen, setReviewModalOpen] = useState(false);
   const [selectedCalendarDay, setSelectedCalendarDay] = useState<CalendarDay | null>(null);
+  const [calendarEntries, setCalendarEntries] = useState<CalendarEntry[]>([]);
 
-  const calendarDays = useMemo(() => generateCalendarDays(), []);
+  const calendarDays = useMemo(
+    () => generateCalendarDays(calendarEntries, today),
+    [calendarEntries, today]
+  );
+  const overallProgress = useMemo(() => getOverallProgress(disciplines), [disciplines]);
+  const perDisciplineProgress = useMemo(
+    () => disciplines.map((discipline) => ({ id: discipline.id, name: discipline.name, ...getDisciplineProgress(discipline) })),
+    [disciplines]
+  );
+  const reviewItems = useMemo(
+    () => buildReviewItems(disciplines, today, REVIEW_CADENCE),
+    [disciplines, today]
+  );
 
   const setDragPayload = (payload: DraggedTopicPayload | null) => {
     draggedTopicRef.current = payload;
     setDraggedTopicState(payload);
   };
 
-  const ensureAuthenticated = async (): Promise<boolean> => {
-    if (typeof window === 'undefined') return true;
-    if (isAuthenticated()) return true;
-    try {
-      await authenticateAnonymously();
-      const authed = isAuthenticated();
-      setAuthReady(authed);
-      if (!authed) {
-        setDragFeedback('Não foi possível autenticar com o Firebase. Verifique as credenciais.');
-      }
-      return authed;
-    } catch (error) {
-      console.error('Anonymous authentication failed:', error);
-      setDragFeedback('Não foi possível autenticar com o Firebase. Verifique as credenciais.');
-      return false;
-    }
-  };
-
-  const persistDisciplines = async (nextDisciplines: Discipline[], successMessage?: string) => {
-    if (!(await ensureAuthenticated())) {
+  const persistAppState = async (
+    nextDisciplines: Discipline[],
+    nextCalendar: CalendarEntry[] = calendarEntries,
+    successMessage?: string
+  ) => {
+    if (!currentUser) {
+      const message = 'Faça login para sincronizar seu progresso.';
+      setAuthError(message);
+      setDragFeedback(message);
       return;
     }
     setIsPersisting(true);
-    const payload = toFirestorePayload(nextDisciplines);
-    const saved = await saveGioConfigToFirestore(payload);
+    const payload = toFirestorePayload(nextDisciplines, nextCalendar);
+    const saved = await saveGioConfigToFirestore(currentUser.uid, payload);
     setIsPersisting(false);
 
     if (!saved) {
       setDragFeedback('Não foi possível sincronizar com o Firestore. Tente novamente.');
     } else if (successMessage) {
       setDragFeedback(successMessage);
+    }
+  };
+
+  const translateAuthError = (error: unknown): string => {
+    if (error instanceof FirebaseError) {
+      switch (error.code) {
+        case 'auth/invalid-email':
+          return 'E-mail inválido. Confira o endereço digitado.';
+        case 'auth/email-already-in-use':
+          return 'Já existe uma conta com este e-mail. Experimente fazer login.';
+        case 'auth/weak-password':
+          return 'A senha deve ter pelo menos 6 caracteres.';
+        case 'auth/user-not-found':
+        case 'auth/invalid-credential':
+        case 'auth/wrong-password':
+          return 'Credenciais inválidas. Verifique e tente novamente.';
+        case 'auth/too-many-requests':
+          return 'Muitas tentativas. Aguarde alguns instantes antes de tentar novamente.';
+        default:
+          return 'Não foi possível concluir a operação. Tente novamente.';
+      }
+    }
+    return 'Não foi possível concluir a operação. Tente novamente.';
+  };
+
+  const handleAuthSubmit = async () => {
+    if (authSubmitting) return;
+    const trimmedEmail = authEmail.trim().toLowerCase();
+    const password = authPassword.trim();
+    if (!trimmedEmail || password.length < 6) {
+      setAuthError('Informe um e-mail válido e uma senha com pelo menos 6 caracteres.');
+      return;
+    }
+
+    setAuthSubmitting(true);
+    setAuthError(null);
+    try {
+      let user: User | null = null;
+      if (authMode === 'login') {
+        user = await signInWithEmail(trimmedEmail, password);
+        setDragFeedback('Login realizado com sucesso.');
+      } else {
+        user = await registerWithEmail(trimmedEmail, password);
+        setDragFeedback('Conta criada com sucesso!');
+      }
+      if (user) {
+        setCurrentUser(user);
+        setAuthReady(true);
+        setAuthEmail(user.email ?? trimmedEmail);
+        setAuthPassword('');
+      }
+    } catch (error) {
+      console.error('Email auth error', error);
+      setAuthError(translateAuthError(error));
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleToggleAuthMode = () => {
+    setAuthMode((prev) => (prev === 'login' ? 'register' : 'login'));
+    setAuthError(null);
+    setAuthPassword('');
+  };
+
+  const handleSignOut = async () => {
+    if (authSubmitting) return;
+    setAuthSubmitting(true);
+    setAuthError(null);
+    try {
+      await signOutUser();
+      setCurrentUser(null);
+      setDisciplines(INITIAL_DISCIPLINES);
+      setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
+      setStudySlots(INITIAL_STUDY_SLOTS);
+      setCalendarEntries([]);
+      setCopiedTopic(null);
+      setDragFeedback('Sessão encerrada. Até logo!');
+    } catch (error) {
+      console.error('Sign-out error', error);
+      setAuthError('Não foi possível sair da conta. Tente novamente.');
+    } finally {
+      setAuthSubmitting(false);
     }
   };
 
@@ -1072,47 +1737,117 @@ const App: React.FC = () => {
   }, [dragFeedback]);
 
   useEffect(() => {
-    let isMounted = true;
-    let unsubscribeAuth: (() => void) | undefined;
+    const interval = setInterval(() => {
+      const current = toDateOnlyString(new Date());
+      setToday((prev) => (prev === current ? prev : current));
+    }, 60_000);
+    return () => clearInterval(interval);
+  }, []);
 
-    if (typeof window !== 'undefined') {
-      unsubscribeAuth = onAuthChange((user) => {
-        if (!isMounted) return;
-        setAuthReady(Boolean(user));
-      });
-
-      if (!isAuthenticated()) {
-        void authenticateAnonymously().catch((error) => {
-          console.error('Anonymous authentication failed:', error);
-          if (isMounted) {
-            setDragFeedback('Não foi possível autenticar com o Firebase. Verifique as credenciais.');
-          }
-        });
-      } else {
-        setAuthReady(true);
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const unsubscribe = onAuthChange((user) => {
+      setCurrentUser(user);
+      setAuthReady(true);
+      if (user?.email) {
+        setAuthEmail(user.email);
       }
+      if (user) {
+        setAuthError(null);
+      } else {
+        setDisciplines(INITIAL_DISCIPLINES);
+        setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
+        setStudySlots(INITIAL_STUDY_SLOTS);
+        setCalendarEntries([]);
+        setCopiedTopic(null);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    if (!currentUser) {
+      setLoadingDisciplines(false);
+      return () => {
+        isMounted = false;
+      };
     }
 
-    const fetchDisciplines = async () => {
+    const fetch = async () => {
       setLoadingDisciplines(true);
-      const remote = await loadGioConfigFromFirestore();
+      let remote = await loadGioConfigFromFirestore(currentUser.uid);
+      if (!remote) {
+        const initialized = await initializeFirestoreWithDefaultData(currentUser.uid);
+        if (initialized) {
+          remote = await loadGioConfigFromFirestore(currentUser.uid);
+        }
+      }
       if (!isMounted) return;
 
-      if (remote && Array.isArray(remote.disciplines) && remote.disciplines.length > 0) {
-        const normalized = remote.disciplines.map((discipline) => ensureDisciplineShape(discipline));
-        setDisciplines(normalized);
-        setExpandedDiscipline(normalized[0]?.id ?? null);
+      if (remote) {
+        if (Array.isArray(remote.disciplines) && remote.disciplines.length > 0) {
+          const normalized = remote.disciplines.map((discipline) => ensureDisciplineShape(discipline));
+          setDisciplines(normalized);
+          setExpandedDiscipline(normalized[0]?.id ?? null);
+        } else {
+          setDisciplines(INITIAL_DISCIPLINES);
+          setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
+        }
+
+        const normalizedCalendar = Array.isArray(remote.calendar)
+          ? sortCalendarEntries(remote.calendar.map((entry) => ensureCalendarEntryShape(entry)))
+          : [];
+        setCalendarEntries(normalizedCalendar);
+      } else {
+        setDisciplines(INITIAL_DISCIPLINES);
+        setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
+        setCalendarEntries([]);
       }
+
+      setStudySlots(INITIAL_STUDY_SLOTS);
+      setCopiedTopic(null);
+      setActiveTab('today');
+      setSelectedReview(null);
+      setSelectedCalendarDay(null);
+      setDragPayload(null);
+      setCompletionContext(null);
+      setCompletionNotes('');
       setLoadingDisciplines(false);
     };
 
-    void fetchDisciplines();
+    void fetch();
 
     return () => {
       isMounted = false;
-      if (unsubscribeAuth) unsubscribeAuth();
     };
-  }, []);
+  }, [currentUser]);
+
+  if (!authReady) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card auth-card--loading">
+          <p>Carregando...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AuthView
+        mode={authMode}
+        email={authEmail}
+        password={authPassword}
+        error={authError}
+        isSubmitting={authSubmitting}
+        onEmailChange={setAuthEmail}
+        onPasswordChange={setAuthPassword}
+        onSubmit={handleAuthSubmit}
+        onToggleMode={handleToggleAuthMode}
+      />
+    );
+  }
 
   const toggleDiscipline = (id: string) => {
     setExpandedDiscipline((current) => (current === id ? null : id));
@@ -1130,7 +1865,7 @@ const App: React.FC = () => {
     };
     setDisciplines((prev) => {
       const next = [...prev, newDiscipline];
-      void persistDisciplines(next, 'Disciplina adicionada.');
+      void persistAppState(next, calendarEntries, 'Disciplina adicionada.');
       return next;
     });
     setExpandedDiscipline(id);
@@ -1183,7 +1918,7 @@ const App: React.FC = () => {
     }
 
     if (nextDisciplines.length) {
-      void persistDisciplines(nextDisciplines);
+      void persistAppState(nextDisciplines, calendarEntries);
     }
   };
 
@@ -1194,13 +1929,14 @@ const App: React.FC = () => {
       const next = prev.map((discipline) => {
         if (discipline.id !== disciplineId) return discipline;
         const updatedTopics = [...discipline.topics, newTopic];
+        const progress = getDisciplineProgress({ ...discipline, topics: updatedTopics });
         return {
           ...discipline,
           topics: updatedTopics,
-          pending: computePendingCount(updatedTopics)
+          pending: progress.pending
         };
       });
-      void persistDisciplines(next, 'Tópico adicionado.');
+      void persistAppState(next, calendarEntries, 'Tópico adicionado.');
       return next;
     });
     setExpandedDiscipline(disciplineId);
@@ -1254,10 +1990,11 @@ const App: React.FC = () => {
           return nextTopic;
         });
 
+        const progress = getDisciplineProgress({ ...discipline, topics: updatedTopics });
         return {
           ...discipline,
           topics: updatedTopics,
-          pending: computePendingCount(updatedTopics)
+          pending: progress.pending
         };
       });
       nextDisciplines = updated;
@@ -1303,23 +2040,148 @@ const App: React.FC = () => {
     }
 
     if (nextDisciplines.length) {
-      void persistDisciplines(nextDisciplines);
+      void persistAppState(nextDisciplines, calendarEntries);
     }
   };
 
-  const applyImportedDisciplines = (raw: unknown) => {
+  const handleRemoveTopic = (disciplineId: string, topicId: string) => {
+    let topicToRemove: StudyTopic | null = null;
+    let disciplineName = '';
+
+    setDisciplines((prev) => {
+      const updated = prev.map((discipline) => {
+        if (discipline.id !== disciplineId) return discipline;
+        const updatedTopics = discipline.topics.filter((topic) => {
+          if (topic.id === topicId) {
+            topicToRemove = topic;
+            return false;
+          }
+          return true;
+        });
+
+        const progress = getDisciplineProgress({ ...discipline, topics: updatedTopics });
+        return {
+          ...discipline,
+          topics: updatedTopics,
+          pending: progress.pending
+        };
+      });
+
+      if (topicToRemove) {
+        const discipline = prev.find(d => d.id === disciplineId);
+        disciplineName = discipline?.name ?? '';
+      }
+
+      return updated;
+    });
+
+    if (topicToRemove) {
+      // Remove assignments from study slots if this topic was assigned
+      setStudySlots((slots) =>
+        slots.map((slot) =>
+          slot.assignedTopic?.topicId === topicId
+            ? { ...slot, assignedTopic: undefined }
+            : slot
+        )
+      );
+
+      // Update dragged topic if it's the one being removed
+      if (draggedTopicRef.current?.topicId === topicId) {
+        setDragPayload(null);
+      }
+
+      // Update copied topic if it's the one being removed
+      if (copiedTopic?.topicId === topicId) {
+        setCopiedTopic(null);
+      }
+
+      // Persist changes
+      setDisciplines((current) => {
+        void persistAppState(current, calendarEntries, `Tópico "${topicToRemove!.name}" removido.`);
+        return current;
+      });
+    }
+  };
+
+  const applyImportedConfiguration = (raw: unknown) => {
     try {
-      const normalized = extractDisciplinesFromJson(raw);
-      setDisciplines(normalized);
+      const { disciplines: importedDisciplines, calendar: importedCalendar } = extractConfigFromJson(raw);
+      setDisciplines(importedDisciplines);
+      setCalendarEntries(sortCalendarEntries(importedCalendar));
       setStudySlots((slots) => slots.map((slot) => ({ ...slot, assignedTopic: undefined })));
-      setExpandedDiscipline(normalized[0]?.id ?? null);
+      setExpandedDiscipline(importedDisciplines[0]?.id ?? null);
       setDragPayload(null);
       setActiveDropSlot(null);
       setRemovalHover(false);
-      void persistDisciplines(normalized, 'Dados importados com sucesso!');
+      void persistAppState(importedDisciplines, importedCalendar, 'Dados importados com sucesso!');
     } catch (error) {
       console.error('Erro ao importar JSON', error);
       setDragFeedback('JSON inválido ou estrutura desconhecida.');
+    }
+  };
+
+  const handleOpenReviewDecision = (review: ReviewItem) => {
+    setSelectedReview(review);
+    setReviewModalOpen(true);
+  };
+
+  const handleReviewDecision = (continueCycle: boolean) => {
+    if (!selectedReview) {
+      setReviewModalOpen(false);
+      return;
+    }
+
+    let updatedDisciplines: Discipline[] = disciplines;
+    let nextCalendarEntries: CalendarEntry[] = calendarEntries;
+
+    if (continueCycle) {
+      const reviewDateIso = new Date(`${selectedReview.dueDate}T00:00:00.000Z`).toISOString();
+      const reviewEntry = {
+        date: reviewDateIso,
+        notes: `Revisão ${selectedReview.sequence}`,
+        type: 'review' as const
+      };
+
+      const disciplineInfo = disciplines.find((item) => item.id === selectedReview.disciplineId);
+      const reviewEvent: CalendarEntry = {
+        id: createId('calendar-entry'),
+        date: selectedReview.dueDate,
+        timestamp: new Date().toISOString(),
+        type: 'review',
+        title: selectedReview.title,
+        disciplineId: selectedReview.disciplineId,
+        disciplineName: disciplineInfo?.name ?? '',
+        topicId: selectedReview.topicId,
+        notes: `Revisão ${selectedReview.sequence}`,
+        reviewSequence: selectedReview.sequence
+      };
+
+      setDisciplines((prev) => {
+        const next = prev.map((discipline) => {
+          if (discipline.id !== selectedReview.disciplineId) return discipline;
+          const updatedTopics = discipline.topics.map((topic) =>
+            topic.id === selectedReview.topicId
+              ? { ...topic, history: [...topic.history, reviewEntry] }
+              : topic
+          );
+          return { ...discipline, topics: updatedTopics };
+        });
+        updatedDisciplines = next;
+        return next;
+      });
+
+      setCalendarEntries((prev) => {
+        const next = sortCalendarEntries([...prev, reviewEvent]);
+        nextCalendarEntries = next;
+        return next;
+      });
+    }
+
+    setReviewModalOpen(false);
+    setSelectedReview(null);
+
+    if (continueCycle) {
+      void persistAppState(updatedDisciplines, nextCalendarEntries, 'Revisão registrada.');
     }
   };
 
@@ -1327,7 +2189,7 @@ const App: React.FC = () => {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text);
-      applyImportedDisciplines(parsed);
+      applyImportedConfiguration(parsed);
     } catch (error) {
       console.error('Erro ao ler arquivo JSON', error);
       setDragFeedback('Não foi possível ler ou interpretar o arquivo JSON fornecido.');
@@ -1337,7 +2199,7 @@ const App: React.FC = () => {
   const handleImportJsonText = (json: string) => {
     try {
       const parsed = JSON.parse(json);
-      applyImportedDisciplines(parsed);
+      applyImportedConfiguration(parsed);
     } catch (error) {
       console.error('Erro ao interpretar JSON manual', error);
       setDragFeedback('JSON inválido. Verifique o texto e tente novamente.');
@@ -1347,7 +2209,7 @@ const App: React.FC = () => {
   const handleExportData = () => {
     if (typeof window === 'undefined') return;
     try {
-      const payload = toFirestorePayload(disciplines);
+      const payload = toFirestorePayload(disciplines, calendarEntries);
       const json = JSON.stringify(payload, null, 2);
       const blob = new Blob([json], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -1367,7 +2229,7 @@ const App: React.FC = () => {
 
   const handleCopyTemplate = async () => {
     try {
-      const payload = toFirestorePayload(disciplines);
+      const payload = toFirestorePayload(disciplines, calendarEntries);
       const json = JSON.stringify(payload, null, 2);
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(json);
@@ -1404,8 +2266,21 @@ const App: React.FC = () => {
     const { slotId, disciplineId, topicId, title } = completionContext;
     const timestamp = new Date().toISOString();
     const notes = completionNotes.trim();
+    const disciplineInfo = disciplines.find((item) => item.id === disciplineId);
+    const studyEvent: CalendarEntry = {
+      id: createId('calendar-entry'),
+      date: toDateOnlyString(timestamp),
+      timestamp,
+      type: 'study',
+      title,
+      disciplineId,
+      disciplineName: disciplineInfo?.name ?? '',
+      topicId,
+      notes: notes || 'Estudo concluído'
+    };
 
     let updatedDisciplines: Discipline[] = [];
+    let nextCalendarEntries: CalendarEntry[] = calendarEntries;
     setDisciplines((prev) => {
       const next = prev.map((discipline) => {
         if (discipline.id !== disciplineId) return discipline;
@@ -1424,13 +2299,20 @@ const App: React.FC = () => {
           };
           return newTopic;
         });
+        const progress = getDisciplineProgress({ ...discipline, topics: updatedTopics });
         return {
           ...discipline,
           topics: updatedTopics,
-          pending: computePendingCount(updatedTopics)
+          pending: progress.pending
         };
       });
       updatedDisciplines = next;
+      return next;
+    });
+
+    setCalendarEntries((prev) => {
+      const next = sortCalendarEntries([...prev, studyEvent]);
+      nextCalendarEntries = next;
       return next;
     });
 
@@ -1441,7 +2323,7 @@ const App: React.FC = () => {
     handleCancelCompletion();
 
     if (updatedDisciplines.length) {
-      void persistDisciplines(updatedDisciplines, `${title} concluído!`);
+      void persistAppState(updatedDisciplines, nextCalendarEntries, `${title} concluído!`);
     }
   };
 
@@ -1510,6 +2392,99 @@ const App: React.FC = () => {
     dropHandledRef.current = false;
   };
 
+  const handleCopyTopic = (disciplineId: string, topicId: string) => {
+    const discipline = disciplines.find((item) => item.id === disciplineId);
+    const topic = discipline?.topics.find((item) => item.id === topicId);
+    if (!discipline || !topic) {
+      setDragFeedback('Não foi possível copiar este tópico.');
+      return;
+    }
+    if (topic.isAssigned) {
+      setDragFeedback('Este tópico já está no plano de hoje. Remova-o antes de copiar.');
+      return;
+    }
+
+    const payload: CopiedTopicPayload = {
+      disciplineId,
+      topicId,
+      title: topic.name,
+      disciplineName: discipline.name,
+      incidence: topic.incidence,
+      difficulty: topic.difficulty,
+      needsReview: topic.needsReview,
+      priorityScore: topic.priorityScore,
+      priorityColor: topic.priorityColor
+    };
+
+    setCopiedTopic(payload);
+    setDragFeedback(`${topic.name} copiado. Vá até os slots e clique em um vazio para colar.`);
+  };
+
+  const handleClearCopiedTopic = () => {
+    setCopiedTopic(null);
+    setDragFeedback('Cópia cancelada.');
+  };
+
+  const handlePasteCopiedTopic = (slotId: string) => {
+    if (!copiedTopic) return;
+    const slot = studySlots.find((item) => item.id === slotId);
+    if (!slot) return;
+
+    if (slot.assignedTopic) {
+      setDragFeedback('Este slot já está preenchido. Libere o espaço antes de colar.');
+      return;
+    }
+
+    const hasRedPriority = studySlots.some((item) => item.assignedTopic?.priorityColor === 'red');
+    if (copiedTopic.priorityColor === 'red' && hasRedPriority) {
+      setDragFeedback('Apenas um tópico do Grupo Vermelho pode ser adicionado por dia.');
+      return;
+    }
+
+    const assignment: AssignedTopic = {
+      topicId: copiedTopic.topicId,
+      disciplineId: copiedTopic.disciplineId,
+      title: copiedTopic.title,
+      discipline: copiedTopic.disciplineName,
+      incidence: copiedTopic.incidence,
+      difficulty: copiedTopic.difficulty,
+      needsReview: copiedTopic.needsReview,
+      priorityScore: copiedTopic.priorityScore,
+      priorityColor: copiedTopic.priorityColor
+    };
+
+    setStudySlots((prev) =>
+      prev.map((slotItem) => (slotItem.id === slotId ? { ...slotItem, assignedTopic: assignment } : slotItem))
+    );
+
+    let updatedDisciplines: Discipline[] = [];
+    setDisciplines((prev) => {
+      const next = prev.map((discipline) => {
+        if (discipline.id !== copiedTopic.disciplineId) {
+          return discipline;
+        }
+        const updatedTopics = discipline.topics.map((topic) =>
+          topic.id === copiedTopic.topicId ? { ...topic, isAssigned: true } : topic
+        );
+        const progress = getDisciplineProgress({ ...discipline, topics: updatedTopics });
+        return {
+          ...discipline,
+          topics: updatedTopics,
+          pending: progress.pending
+        };
+      });
+      updatedDisciplines = next;
+      return next;
+    });
+
+    setCopiedTopic(null);
+    setDragFeedback(`${assignment.title} adicionado ao plano.`);
+
+    if (updatedDisciplines.length) {
+      void persistAppState(updatedDisciplines, calendarEntries);
+    }
+  };
+
   const handleDragOverSlot = (slotId: string) => {
     if (!draggedTopic) return;
     setActiveDropSlot(slotId);
@@ -1535,10 +2510,11 @@ const App: React.FC = () => {
             ? { ...topic, isAssigned: false }
             : topic
         );
+        const progress = getDisciplineProgress({ ...discipline, topics: updatedTopics });
         return {
           ...discipline,
           topics: updatedTopics,
-          pending: computePendingCount(updatedTopics)
+          pending: progress.pending
         };
       });
       nextDisciplines = updated;
@@ -1552,7 +2528,7 @@ const App: React.FC = () => {
     }
 
     if (shouldPersist && nextDisciplines.length) {
-      void persistDisciplines(nextDisciplines);
+      void persistAppState(nextDisciplines, calendarEntries);
     }
   };
 
@@ -1603,10 +2579,11 @@ const App: React.FC = () => {
           const updatedTopics = discipline.topics.map((topic) =>
             topic.id === payload.topicId ? { ...topic, isAssigned: true } : topic
           );
+          const progress = getDisciplineProgress({ ...discipline, topics: updatedTopics });
           return {
             ...discipline,
             topics: updatedTopics,
-            pending: computePendingCount(updatedTopics)
+            pending: progress.pending
           };
         });
         updatedDisciplines = next;
@@ -1618,9 +2595,12 @@ const App: React.FC = () => {
       setRemovalHover(false);
       setDragFeedback(null);
       setDragPayload(null);
+      if (copiedTopic?.topicId === payload.topicId) {
+        setCopiedTopic(null);
+      }
 
       if (updatedDisciplines.length) {
-        void persistDisciplines(updatedDisciplines);
+        void persistAppState(updatedDisciplines, calendarEntries);
       }
       return;
     }
@@ -1734,13 +2714,24 @@ const App: React.FC = () => {
     <div className="app-shell">
       <header className="app-header">
         <ClockPanel />
+        <PomodoroTimer />
         <MediaSlot />
         <FidgetCube onClick={() => setProgressModalOpen(true)} />
       </header>
 
+      {currentUser?.email && (
+        <UserBar email={currentUser.email} onSignOut={handleSignOut} disabled={authSubmitting || isPersisting} />
+      )}
+
       {(isLoadingDisciplines || isPersisting) && (
         <div className="sync-banner" role="status">
           {isLoadingDisciplines ? 'Carregando disciplinas...' : 'Sincronizando com o Firestore...'}
+        </div>
+      )}
+
+      {authError && (
+        <div className="auth-alert" role="alert">
+          {authError}
         </div>
       )}
 
@@ -1762,15 +2753,17 @@ const App: React.FC = () => {
           <TodayView
             disciplines={disciplines}
             studySlots={studySlots}
+            reviews={reviewItems}
             expandedDiscipline={expandedDiscipline}
             draggedTopic={draggedTopic}
             activeDropSlot={activeDropSlot}
+            copiedTopic={copiedTopic}
             dragFeedback={dragFeedback}
             onToggleDiscipline={toggleDiscipline}
             onTopicDragStart={handleTopicDragStart}
             onTopicDragEnd={handleTopicDragEnd}
             onOpenCompletion={handleOpenCompletion}
-            onOpenDecision={() => setReviewModalOpen(true)}
+            onOpenDecision={handleOpenReviewDecision}
             onDropTopic={handleDropTopic}
             onDragOverSlot={handleDragOverSlot}
             onDragLeaveSlot={handleDragLeaveSlot}
@@ -1780,6 +2773,9 @@ const App: React.FC = () => {
             onRemovalDragEnter={handleRemovalDragEnter}
             onRemovalDragLeave={handleRemovalDragLeave}
             onRemovalDrop={handleRemovalDrop}
+            onCopyTopic={handleCopyTopic}
+            onPasteCopiedTopic={handlePasteCopiedTopic}
+            onClearCopiedTopic={handleClearCopiedTopic}
             isRemovalHover={isRemovalHover}
           />
         )}
@@ -1800,6 +2796,7 @@ const App: React.FC = () => {
             onUpdateDisciplineField={handleUpdateDisciplineField}
             onAddTopic={handleAddTopic}
             onUpdateTopicField={handleUpdateTopicField}
+            onRemoveTopic={handleRemoveTopic}
             onExport={handleExportData}
             onCopyTemplate={handleCopyTemplate}
             onImportFile={handleImportFile}
@@ -1820,13 +2817,21 @@ const App: React.FC = () => {
           )}
         >
           <div className="progress-summary">
-            <div className="progress-highlight">74%</div>
-            <p>Dos tópicos concluídos no plano geral de estudos.</p>
-            <ul>
-              <li>Disciplinas completas: 3</li>
-              <li>Revisões em andamento: 8</li>
-              <li>Tarefas atrasadas: 2</li>
-            </ul>
+            <div className="progress-highlight">{overallProgress.percentage}%</div>
+            <p>
+              {overallProgress.completed} de {overallProgress.total} tópicos concluídos · {overallProgress.pending} pendentes
+            </p>
+            {perDisciplineProgress.length > 0 ? (
+              <ul>
+                {perDisciplineProgress.map((progress) => (
+                  <li key={progress.id}>
+                    {progress.name}: {progress.completed}/{progress.total} concluídos ({progress.percentage}%)
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>Nenhuma disciplina cadastrada ainda.</p>
+            )}
           </div>
         </Modal>
       )}
@@ -1869,62 +2874,84 @@ const App: React.FC = () => {
       {isReviewModalOpen && (
         <Modal
           title="Revisar novamente?"
-          onClose={() => setReviewModalOpen(false)}
+          onClose={() => handleReviewDecision(false)}
           actions={(
             <>
-              <button type="button" className="ghost-button" onClick={() => setReviewModalOpen(false)}>
+              <button type="button" className="ghost-button" onClick={() => handleReviewDecision(false)}>
                 Não agora
               </button>
-              <button type="button" className="primary-button" onClick={() => setReviewModalOpen(false)}>
+              <button type="button" className="primary-button" onClick={() => handleReviewDecision(true)}>
                 Sim, continuar ciclo
               </button>
             </>
           )}
         >
-          <p>Deseja manter este tópico no fluxo de revisões automáticas?</p>
+          <p>
+            {selectedReview
+              ? `Registrar revisão para ${selectedReview.title} (${selectedReview.scheduled}).`
+              : 'Selecione uma revisão para decidir.'}
+          </p>
         </Modal>
       )}
 
-      {selectedCalendarDay && selectedCalendarDay.type === 'day' && (
-        <Modal
-          title={`Detalhes do dia ${selectedCalendarDay.dayNumber}`}
-          onClose={() => setSelectedCalendarDay(null)}
-          actions={(
-            <button type="button" className="primary-button" onClick={() => setSelectedCalendarDay(null)}>
-              Entendi
-            </button>
-          )}
-        >
-          {selectedCalendarDay.status ? (
+      {selectedCalendarDay && selectedCalendarDay.type === 'day' && (() => {
+        const events = selectedCalendarDay.events ?? [];
+        const parsed = selectedCalendarDay.date ? parseDateOnly(selectedCalendarDay.date) : null;
+        const readableDate = parsed
+          ? parsed.toLocaleDateString('pt-BR', { day: '2-digit', month: 'long', year: 'numeric' })
+          : `dia ${selectedCalendarDay.dayNumber}`;
+        const statusLabel = selectedCalendarDay.status ? STATUS_LABEL[selectedCalendarDay.status] : null;
+
+        return (
+          <Modal
+            title={`Detalhes de ${readableDate}`}
+            onClose={() => setSelectedCalendarDay(null)}
+            actions={(
+              <button type="button" className="primary-button" onClick={() => setSelectedCalendarDay(null)}>
+                Entendi
+              </button>
+            )}
+          >
             <div className="calendar-modal">
-              <span className={`status-badge status-${selectedCalendarDay.status}`}>
-                {STATUS_LABEL[selectedCalendarDay.status]}
-              </span>
-              {selectedCalendarDay.status === 'study' && (
-                <ul>
-                  <li>Funções Exponenciais · Concluído</li>
-                  <li>Eletroquímica · Planejado</li>
-                </ul>
+              {statusLabel && (
+                <span className={`status-badge status-${selectedCalendarDay.status}`}>
+                  {statusLabel}
+                </span>
               )}
-              {selectedCalendarDay.status === 'review' && (
-                <ul>
-                  <li>Revisão de Citologia · 20 min</li>
-                  <li>Mapa mental de História · 15 min</li>
+
+              {events.length > 0 ? (
+                <ul className="calendar-modal__list">
+                  {events.map((event) => {
+                    const timeLabel = new Date(event.timestamp).toLocaleTimeString('pt-BR', {
+                      hour: '2-digit',
+                      minute: '2-digit'
+                    });
+                    const badgeClass = event.type === 'study' ? 'status-study' : 'status-review';
+                    const badgeLabel = event.type === 'study' ? 'Estudo' : 'Revisão';
+                    return (
+                      <li key={event.id}>
+                        <span className={`status-badge ${badgeClass}`}>{badgeLabel}</span>
+                        <div className="calendar-modal__details">
+                          <strong>{event.title}</strong>
+                          <small>
+                            {event.disciplineName ? `${event.disciplineName} · ${timeLabel}` : timeLabel}
+                          </small>
+                          {event.type === 'review' && event.reviewSequence && (
+                            <small>{`Revisão ${event.reviewSequence}`}</small>
+                          )}
+                          {event.notes && <p>{event.notes}</p>}
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
+              ) : (
+                <p>Nenhuma atividade registrada nesta data.</p>
               )}
-              {selectedCalendarDay.status === 'mixed' && (
-                <ul>
-                  <li>Probabilidade Básica · Concluído</li>
-                  <li>Flashcards de Literatura · Revisão</li>
-                </ul>
-              )}
-              {selectedCalendarDay.status === 'rest' && <p>Dia reservado para descanso e ajustes.</p>}
             </div>
-          ) : (
-            <p>Nenhuma atividade registrada nesta data.</p>
-          )}
-        </Modal>
-      )}
+          </Modal>
+        );
+      })()}
     </div>
   );
 };
