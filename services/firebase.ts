@@ -39,14 +39,7 @@ if (typeof window !== 'undefined') {
 const db = getFirestore(app);
 const auth = getAuth(app);
 
-export const authenticateAnonymously = async (): Promise<void> => {
-  try {
-    await signInAnonymously(auth);
-    console.log('Authenticated anonymously');
-  } catch (error) {
-    console.error('Anonymous authentication failed:', error);
-  }
-};
+// Anonymous authentication removed - users must login with email/password
 
 export const onAuthChange = (callback: (user: User | null) => void): (() => void) => onAuthStateChanged(auth, callback);
 

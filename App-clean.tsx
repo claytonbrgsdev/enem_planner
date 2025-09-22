@@ -1,39 +1,63 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
+  User,
   signInWithEmail,
   registerWithEmail,
   signOutUser,
   getCurrentUser,
   onAuthChange
 } from './services/firebase';
-import { loadGioConfigFromFirestore, saveGioConfigToFirestore } from './services/firestoreService';
+import { loadGioConfigFromFirestore, saveGioConfigToFirestore, initializeFirestoreWithDefaultData } from './services/firestoreService';
+import {
+  Discipline,
+  StudyTopic,
+  StudySlot,
+  ReviewItem,
+  CalendarEntry,
+  CalendarDay,
+  DraggedTopicPayload,
+  CopiedTopicPayload,
+  FirestoreTopic,
+  FirestoreDiscipline,
+  FirestoreCalendarEntry,
+  GioConfig
+} from './types';
+import {
+  INITIAL_DISCIPLINES,
+  INITIAL_STUDY_SLOTS,
+  REVIEW_CADENCE,
+  REVIEW_TIMES,
+  createId,
+  clampPriorityValue,
+  calculatePriority,
+  toDateOnlyString,
+  addDays,
+  priorityLabel,
+  priorityClass,
+  computePendingCount,
+  createTopic,
+  ensureTopicShape,
+  ensureDisciplineShape,
+  ensureCalendarEntryShape,
+  sortCalendarEntries,
+  parseDateOnly,
+  formatDateOnly,
+  getCalendarDayStatus,
+  summarizeCalendarEvents,
+  isTopicCompleted,
+  getDisciplineProgress,
+  getOverallProgress,
+  buildReviewItems,
+  serializeCalendarEntry,
+  toFirestorePayload,
+  extractConfigFromJson,
+  STATUS_LABEL
+} from './constants';
 import ambientVideo from './assets/video_background.mp4';
 import fallbackVideo from './assets/video_telinha.mp4';
-import './App.css';
-
-// Tipos básicos (definidos inline por enquanto)
-type Discipline = any;
-type StudyTopic = any;
-type StudySlot = any;
-type ReviewItem = any;
-type CalendarEntry = any;
-type CalendarDay = any;
-type DraggedTopicPayload = any;
-type CopiedTopicPayload = any;
-
-// Constantes básicas
-const INITIAL_DISCIPLINES: Discipline[] = [];
-const INITIAL_STUDY_SLOTS: StudySlot[] = [
-  { id: 'slot-1', label: 'Manhã' },
-  { id: 'slot-2', label: 'Tarde' },
-  { id: 'slot-3', label: 'Noite' },
-  { id: 'slot-4', label: 'Extra' }
-];
 
 type TabId = 'today' | 'calendar' | 'settings';
 type RouteId = 'login' | 'app';
-
-// TABS definido no final do arquivo
 
 type PriorityColor = 'green' | 'yellow' | 'red';
 
@@ -60,7 +84,7 @@ const TABS: Array<{ id: TabId; label: string }> = [
 const App: React.FC = () => {
   // Estados de roteamento
   const [currentRoute, setCurrentRoute] = useState<RouteId>('login');
-  const [currentUser, setCurrentUser] = useState<any | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
 
   // Estados de autenticação
@@ -82,7 +106,7 @@ const App: React.FC = () => {
   const [dragFeedback, setDragFeedback] = useState<string | null>(null);
   const [copiedTopic, setCopiedTopic] = useState<CopiedTopicPayload | null>(null);
   const [isRemovalHover, setRemovalHover] = useState(false);
-  const [today, setToday] = useState(() => new Date().toISOString().split('T')[0]);
+  const [today, setToday] = useState(() => toDateOnlyString(new Date()));
   const [selectedReview, setSelectedReview] = useState<ReviewItem | null>(null);
   const [isLoadingDisciplines, setLoadingDisciplines] = useState(false);
   const [isPersisting, setIsPersisting] = useState(false);
@@ -94,6 +118,22 @@ const App: React.FC = () => {
   const [selectedCalendarDay, setSelectedCalendarDay] = useState<CalendarDay | null>(null);
   const [calendarEntries, setCalendarEntries] = useState<CalendarEntry[]>([]);
   const [dragPayload, setDragPayload] = useState<DraggedTopicPayload | null>(null);
+
+  // Função para persistir estado da aplicação
+  const persistAppState = async (newDisciplines: Discipline[], newCalendar: CalendarEntry[], message: string) => {
+    if (!currentUser || isPersisting) return;
+
+    setIsPersisting(true);
+    try {
+      await saveGioConfigToFirestore(currentUser.uid, toFirestorePayload(newDisciplines, newCalendar));
+      setDragFeedback(message);
+    } catch (error) {
+      console.error('Erro ao salvar:', error);
+      setAuthError('Erro ao salvar dados');
+    } finally {
+      setIsPersisting(false);
+    }
+  };
 
   // Função para traduzir erros de autenticação
   const translateAuthError = (error: unknown): string => {
@@ -108,8 +148,8 @@ const App: React.FC = () => {
     return 'Não foi possível concluir a operação. Tente novamente.';
   };
 
-  // Handler de autenticação (memoizado)
-  const handleAuthSubmit = useCallback(async () => {
+  // Handler de autenticação
+  const handleAuthSubmit = async () => {
     if (authSubmitting) return;
     const trimmedEmail = authEmail.trim().toLowerCase();
     const password = authPassword.trim();
@@ -121,7 +161,7 @@ const App: React.FC = () => {
     setAuthSubmitting(true);
     setAuthError(null);
     try {
-      let user: any | null = null;
+      let user: User | null = null;
       if (authMode === 'login') {
         user = await signInWithEmail(trimmedEmail, password);
       } else {
@@ -141,10 +181,10 @@ const App: React.FC = () => {
     } finally {
       setAuthSubmitting(false);
     }
-  }, [authSubmitting, authEmail, authPassword, authMode]);
+  };
 
-  // Handler de logout (memoizado)
-  const handleSignOut = useCallback(async () => {
+  // Handler de logout
+  const handleSignOut = async () => {
     if (authSubmitting) return;
     setAuthSubmitting(true);
     setAuthError(null);
@@ -174,14 +214,14 @@ const App: React.FC = () => {
     } finally {
       setAuthSubmitting(false);
     }
-  }, [authSubmitting]);
+  };
 
-  // Handler para alternar modo de autenticação (memoizado)
-  const handleToggleAuthMode = useCallback(() => {
+  // Handler para alternar modo de autenticação
+  const handleToggleAuthMode = () => {
     setAuthMode((prev) => (prev === 'login' ? 'register' : 'login'));
     setAuthError(null);
     setAuthPassword('');
-  }, []);
+  };
 
   // Efeito para validar usuário inicial e controlar rotas
   useEffect(() => {
@@ -303,21 +343,28 @@ const App: React.FC = () => {
         console.log('📋 Firestore data loaded:', remote ? 'success' : 'failed');
 
         if (!remote) {
-          console.log('📝 No data found for user, using empty state');
+          console.log('📝 Initializing default data...');
+          const initialized = await initializeFirestoreWithDefaultData(currentUser.uid);
+          if (initialized) {
+            remote = await loadGioConfigFromFirestore(currentUser.uid);
+          }
         }
 
         if (!isMounted) return;
 
         if (remote) {
           if (Array.isArray(remote.disciplines) && remote.disciplines.length > 0) {
-            setDisciplines(remote.disciplines);
-            setExpandedDiscipline(remote.disciplines[0]?.id ?? null);
+            const normalized = remote.disciplines.map((discipline) => ensureDisciplineShape(discipline));
+            setDisciplines(normalized);
+            setExpandedDiscipline(normalized[0]?.id ?? null);
           } else {
             setDisciplines(INITIAL_DISCIPLINES);
             setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
           }
 
-          const normalizedCalendar = Array.isArray(remote.calendar) ? remote.calendar : [];
+          const normalizedCalendar = Array.isArray(remote.calendar)
+            ? sortCalendarEntries(remote.calendar.map((entry) => ensureCalendarEntryShape(entry)))
+            : [];
           setCalendarEntries(normalizedCalendar);
         } else {
           console.log('❌ No valid data found, redirecting to login');
@@ -358,15 +405,17 @@ const App: React.FC = () => {
   };
 
   const handleAddDiscipline = () => {
+    const id = createId('discipline');
+    const topics: StudyTopic[] = [];
     const newDiscipline: Discipline = {
-      id: 'new-' + Date.now(),
+      id,
       name: 'Nova disciplina',
       weight: 1,
-      topics: [],
+      topics,
       pending: 0
     };
     setDisciplines((prev) => [...prev, newDiscipline]);
-    setExpandedDiscipline(newDiscipline.id);
+    setExpandedDiscipline(id);
   };
 
   const handleUpdateDisciplineField = (disciplineId: string, field: 'name' | 'weight', value: string | number) => {
@@ -380,24 +429,12 @@ const App: React.FC = () => {
   };
 
   const handleAddTopic = (disciplineId: string) => {
-    const newTopic: StudyTopic = {
-      id: 'topic-' + Date.now(),
-      disciplineId,
-      name: 'Novo tópico',
-      description: '',
-      incidence: 1,
-      difficulty: 1,
-      needsReview: false,
-      priorityScore: 3,
-      priorityColor: 'green' as const,
-      completionDate: null,
-      history: [],
-      isAssigned: false
-    };
+    const topicId = createId('topic');
+    const newTopic = createTopic(disciplineId, topicId, 'Novo tópico', 1, 1, false);
     setDisciplines((prev) =>
       prev.map((discipline) =>
         discipline.id === disciplineId
-          ? { ...discipline, topics: [...(discipline.topics || []), newTopic] }
+          ? { ...discipline, topics: [...discipline.topics, newTopic] }
           : discipline
       )
     );
@@ -415,7 +452,7 @@ const App: React.FC = () => {
         discipline.id === disciplineId
           ? {
               ...discipline,
-              topics: (discipline.topics || []).map((topic) =>
+              topics: discipline.topics.map((topic) =>
                 topic.id === topicId
                   ? { ...topic, [field]: field === 'name' ? String(value) : value }
                   : topic
@@ -432,7 +469,7 @@ const App: React.FC = () => {
         discipline.id === disciplineId
           ? {
               ...discipline,
-              topics: (discipline.topics || []).filter((topic) => topic.id !== topicId)
+              topics: discipline.topics.filter((topic) => topic.id !== topicId)
             }
           : discipline
       )
@@ -468,29 +505,6 @@ const App: React.FC = () => {
   const overallProgress = { percentage: 0, completed: 0, total: 0, pending: 0 };
   const perDisciplineProgress = [];
 
-  // Funções utilitárias simples
-  const getDisciplineProgress = (discipline: Discipline) => {
-    const total = (discipline.topics || []).length;
-    const completed = (discipline.topics || []).filter(t => t.completionDate).length;
-    const pending = total - completed;
-    const percentage = total === 0 ? 0 : Math.round((completed / total) * 100);
-    return { total, completed, pending, percentage };
-  };
-
-  const priorityClass = {
-    green: 'topic-card priority-green',
-    yellow: 'topic-card priority-yellow',
-    red: 'topic-card priority-red'
-  };
-
-  const priorityLabel = {
-    green: 'Prioridade baixa',
-    yellow: 'Prioridade moderada',
-    red: 'Alta prioridade'
-  };
-
-  const isTopicCompleted = (topic: StudyTopic): boolean => Boolean(topic.completionDate);
-
   // Componente de loading
   const LoadingComponent = () => (
     <div className="auth-shell">
@@ -509,6 +523,63 @@ const App: React.FC = () => {
     </div>
   );
 
+  // Componente de autenticação
+  const AuthView: React.FC = () => (
+    <div className="auth-shell">
+      <div className="auth-card">
+        <header className="auth-header">
+          <h1>GIO · Organizador de Estudos</h1>
+          <p>Mantenha seus dados sincronizados em qualquer dispositivo.</p>
+        </header>
+
+        <form
+          className="auth-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleAuthSubmit();
+          }}
+        >
+          <label className="form-field">
+            <span>E-mail</span>
+            <input
+              type="email"
+              value={authEmail}
+              autoComplete="email"
+              placeholder="voce@exemplo.com"
+              onChange={(event) => setAuthEmail(event.target.value)}
+              required
+            />
+          </label>
+
+          <label className="form-field">
+            <span>Senha</span>
+            <input
+              type="password"
+              value={authPassword}
+              autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+              placeholder="••••••••"
+              onChange={(event) => setAuthPassword(event.target.value)}
+              minLength={6}
+              required
+            />
+          </label>
+
+          {authError && <p className="auth-error" role="alert">{authError}</p>}
+
+          <button type="submit" className="primary-button" disabled={authSubmitting}>
+            {authSubmitting ? 'Processando...' : authMode === 'login' ? 'Entrar' : 'Criar conta'}
+          </button>
+        </form>
+
+        <footer className="auth-footer">
+          <span>{authMode === 'login' ? 'Ainda não tem conta?' : 'Já possui conta?'}</span>
+          <button type="button" className="ghost-button" onClick={handleToggleAuthMode} disabled={authSubmitting}>
+            {authMode === 'login' ? 'Criar uma conta' : 'Fazer login'}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
 
   // Sistema de roteamento
   if (!authReady) {
@@ -517,19 +588,7 @@ const App: React.FC = () => {
 
   // Rota de login
   if (currentRoute === 'login') {
-    return (
-      <AuthView
-        authMode={authMode}
-        authEmail={authEmail}
-        authPassword={authPassword}
-        authError={authError}
-        authSubmitting={authSubmitting}
-        onEmailChange={setAuthEmail}
-        onPasswordChange={setAuthPassword}
-        onSubmit={handleAuthSubmit}
-        onToggleMode={handleToggleAuthMode}
-      />
-    );
+    return <AuthView />;
   }
 
   // Rota da aplicação - só renderiza se usuário estiver logado
@@ -586,7 +645,7 @@ const App: React.FC = () => {
         )}
 
         <nav className="tab-strip">
-          {TABS_FINAL.map((tab) => (
+          {TABS.map((tab) => (
             <button
               key={tab.id}
               type="button"
@@ -999,90 +1058,5 @@ const App: React.FC = () => {
   // Esta linha nunca será executada
   return null;
 };
-
-// Componente de autenticação (movido para fora do App para evitar re-renders)
-const AuthView: React.FC<{
-  authMode: 'login' | 'register';
-  authEmail: string;
-  authPassword: string;
-  authError: string | null;
-  authSubmitting: boolean;
-  onEmailChange: (value: string) => void;
-  onPasswordChange: (value: string) => void;
-  onSubmit: () => void;
-  onToggleMode: () => void;
-}> = ({
-  authMode,
-  authEmail,
-  authPassword,
-  authError,
-  authSubmitting,
-  onEmailChange,
-  onPasswordChange,
-  onSubmit,
-  onToggleMode
-}) => (
-  <div className="auth-shell">
-    <div className="auth-card">
-      <header className="auth-header">
-        <h1>GIO · Organizador de Estudos</h1>
-        <p>Mantenha seus dados sincronizados em qualquer dispositivo.</p>
-      </header>
-
-      <form
-        className="auth-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onSubmit();
-        }}
-      >
-        <label className="form-field">
-          <span>E-mail</span>
-          <input
-            type="email"
-            value={authEmail}
-            autoComplete="email"
-            placeholder="voce@exemplo.com"
-            onChange={(event) => onEmailChange(event.target.value)}
-            required
-          />
-        </label>
-
-        <label className="form-field">
-          <span>Senha</span>
-          <input
-            type="password"
-            value={authPassword}
-            autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
-            placeholder="••••••••"
-            onChange={(event) => onPasswordChange(event.target.value)}
-            minLength={6}
-            required
-          />
-        </label>
-
-        {authError && <p className="auth-error" role="alert">{authError}</p>}
-
-        <button type="submit" className="primary-button" disabled={authSubmitting}>
-          {authSubmitting ? 'Processando...' : authMode === 'login' ? 'Entrar' : 'Criar conta'}
-        </button>
-      </form>
-
-      <footer className="auth-footer">
-        <span>{authMode === 'login' ? 'Ainda não tem conta?' : 'Já possui conta?'}</span>
-        <button type="button" className="ghost-button" onClick={onToggleMode} disabled={authSubmitting}>
-          {authMode === 'login' ? 'Criar uma conta' : 'Fazer login'}
-        </button>
-      </footer>
-    </div>
-  </div>
-);
-
-// Constantes no final do arquivo
-const TABS_FINAL = [
-  { id: 'today' as const, label: 'Hoje' },
-  { id: 'calendar' as const, label: 'Calendário' },
-  { id: 'settings' as const, label: 'Configurações' }
-];
 
 export default App;
