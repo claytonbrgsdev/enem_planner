@@ -1574,11 +1574,11 @@ const generateCalendarDays = (entries: CalendarEntry[], referenceKey: string): C
 };
 
 const App: React.FC = () => {
-  const initialUser = typeof window === 'undefined' ? null : getCurrentUser();
-  const [currentUser, setCurrentUser] = useState<User | null>(null); // Sempre iniciar como null para validar
+  // Não usar getCurrentUser() diretamente - deixar a validação no useEffect
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
-  const [authEmail, setAuthEmail] = useState(initialUser?.email ?? '');
+  const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>('today');
@@ -1748,39 +1748,123 @@ const App: React.FC = () => {
   // Efeito para validar usuário inicial
   useEffect(() => {
     const validateInitialUser = async () => {
+      console.log('🔍 Starting initial user validation...');
+
       if (typeof window === 'undefined') {
+        console.log('🏃‍♂️ Server-side rendering, skipping validation');
         setAuthReady(true);
         return;
       }
 
       const user = getCurrentUser();
+      console.log('👤 Current user from Firebase Auth:', user ? {
+        uid: user.uid,
+        email: user.email,
+        emailVerified: user.emailVerified,
+        isAnonymous: user.isAnonymous
+      } : 'null');
+
       if (user) {
+        console.log('✅ User found in Firebase Auth, validating Firestore data...');
+
         // Verificar se o usuário tem dados válidos no Firestore
         try {
           const remote = await loadGioConfigFromFirestore(user.uid);
-          if (remote) {
-            // Usuário válido com dados
-            setCurrentUser(user);
-            setAuthReady(true);
-            if (user.email) {
-              setAuthEmail(user.email);
+          console.log('📊 Firestore data loaded:', remote ? {
+            hasDisciplines: Array.isArray(remote.disciplines),
+            disciplinesCount: remote.disciplines?.length || 0,
+            hasCalendar: Array.isArray(remote.calendar),
+            calendarCount: remote.calendar?.length || 0
+          } : 'null');
+
+          if (remote && Array.isArray(remote.disciplines)) {
+            // Verificar se os dados são realmente válidos
+            const hasValidDisciplines = remote.disciplines.length > 0;
+            console.log('🔍 Data validation:', {
+              hasValidDisciplines,
+              disciplines: remote.disciplines.slice(0, 2) // Log apenas os 2 primeiros
+            });
+
+            if (hasValidDisciplines) {
+              // Usuário válido com dados reais
+              console.log('✅ User has valid data, proceeding with authentication');
+              setCurrentUser(user);
+              setAuthReady(true);
+              if (user.email) {
+                setAuthEmail(user.email);
+              }
+            } else {
+              // Usuário existe mas não tem dados válidos - sessão inválida
+              console.log('❌ User found but no valid disciplines data, forcing complete session reset');
+              await signOutUser();
+
+              // Reset completo do estado da aplicação
+              setCurrentUser(null);
+              setAuthEmail('');
+              setAuthError(null);
+              setSessionValidationError('Sessão inválida detectada. Faça login novamente.');
+
+              // Reset dos dados da aplicação
+              setDisciplines(INITIAL_DISCIPLINES);
+              setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
+              setStudySlots(INITIAL_STUDY_SLOTS);
+              setCalendarEntries([]);
+              setCopiedTopic(null);
+              setDragPayload(null);
+              setCompletionContext(null);
+              setCompletionNotes('');
+
+              setAuthReady(true);
             }
           } else {
             // Usuário existe mas não tem dados válidos - sessão inválida
-            console.log('User found but no valid Firestore data, signing out');
+            console.log('❌ User found but no valid Firestore data structure, forcing complete session reset');
             await signOutUser();
+
+            // Reset completo do estado da aplicação
+            setCurrentUser(null);
+            setAuthEmail('');
+            setAuthError(null);
             setSessionValidationError('Sessão inválida detectada. Faça login novamente.');
+
+            // Reset dos dados da aplicação
+            setDisciplines(INITIAL_DISCIPLINES);
+            setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
+            setStudySlots(INITIAL_STUDY_SLOTS);
+            setCalendarEntries([]);
+            setCopiedTopic(null);
+            setDragPayload(null);
+            setCompletionContext(null);
+            setCompletionNotes('');
+
             setAuthReady(true);
           }
         } catch (error) {
-          console.log('Error validating initial user:', error);
+          console.error('❌ Error validating initial user:', error);
           // Em caso de erro, considerar inválido
           await signOutUser();
+
+          // Reset completo do estado da aplicação
+          setCurrentUser(null);
+          setAuthEmail('');
+          setAuthError(null);
           setSessionValidationError('Erro ao validar sessão. Faça login novamente.');
+
+          // Reset dos dados da aplicação
+          setDisciplines(INITIAL_DISCIPLINES);
+          setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
+          setStudySlots(INITIAL_STUDY_SLOTS);
+          setCalendarEntries([]);
+          setCopiedTopic(null);
+          setDragPayload(null);
+          setCompletionContext(null);
+          setCompletionNotes('');
+
           setAuthReady(true);
         }
       } else {
         // Nenhum usuário encontrado
+        console.log('✅ No user found, auth ready');
         setAuthReady(true);
       }
     };
@@ -1791,18 +1875,29 @@ const App: React.FC = () => {
   useEffect(() => {
     if (typeof window === 'undefined') return undefined;
     const unsubscribe = onAuthChange(async (user) => {
+      console.log('🔄 Auth state changed:', user ? {
+        uid: user.uid,
+        email: user.email,
+        isAnonymous: user.isAnonymous
+      } : 'null');
+
       setCurrentUser(user);
       if (user?.email) {
         setAuthEmail(user.email);
       }
       if (user) {
         setAuthError(null);
+        // Se um usuário foi definido, mas ainda não validamos, deixar o useEffect de currentUser lidar com isso
       } else {
+        // Reset dos dados quando usuário é removido
         setDisciplines(INITIAL_DISCIPLINES);
         setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
         setStudySlots(INITIAL_STUDY_SLOTS);
         setCalendarEntries([]);
         setCopiedTopic(null);
+        setDragPayload(null);
+        setCompletionContext(null);
+        setCompletionNotes('');
       }
     });
     return () => unsubscribe();
