@@ -1575,8 +1575,8 @@ const generateCalendarDays = (entries: CalendarEntry[], referenceKey: string): C
 
 const App: React.FC = () => {
   const initialUser = typeof window === 'undefined' ? null : getCurrentUser();
-  const [currentUser, setCurrentUser] = useState<User | null>(initialUser);
-  const [authReady, setAuthReady] = useState(() => (typeof window === 'undefined' ? true : Boolean(initialUser)));
+  const [currentUser, setCurrentUser] = useState<User | null>(null); // Sempre iniciar como null para validar
+  const [authReady, setAuthReady] = useState(false);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authEmail, setAuthEmail] = useState(initialUser?.email ?? '');
   const [authPassword, setAuthPassword] = useState('');
@@ -1594,6 +1594,7 @@ const App: React.FC = () => {
   const [isRemovalHover, setRemovalHover] = useState(false);
   const [today, setToday] = useState(() => toDateOnlyString(new Date()));
   const [authError, setAuthError] = useState<string | null>(null);
+  const [sessionValidationError, setSessionValidationError] = useState<string | null>(null);
   const [selectedReview, setSelectedReview] = useState<ReviewItem | null>(null);
   const [isLoadingDisciplines, setLoadingDisciplines] = useState(false);
   const [isPersisting, setIsPersisting] = useState(false);
@@ -1744,11 +1745,53 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
+  // Efeito para validar usuário inicial
+  useEffect(() => {
+    const validateInitialUser = async () => {
+      if (typeof window === 'undefined') {
+        setAuthReady(true);
+        return;
+      }
+
+      const user = getCurrentUser();
+      if (user) {
+        // Verificar se o usuário tem dados válidos no Firestore
+        try {
+          const remote = await loadGioConfigFromFirestore(user.uid);
+          if (remote) {
+            // Usuário válido com dados
+            setCurrentUser(user);
+            setAuthReady(true);
+            if (user.email) {
+              setAuthEmail(user.email);
+            }
+          } else {
+            // Usuário existe mas não tem dados válidos - sessão inválida
+            console.log('User found but no valid Firestore data, signing out');
+            await signOutUser();
+            setSessionValidationError('Sessão inválida detectada. Faça login novamente.');
+            setAuthReady(true);
+          }
+        } catch (error) {
+          console.log('Error validating initial user:', error);
+          // Em caso de erro, considerar inválido
+          await signOutUser();
+          setSessionValidationError('Erro ao validar sessão. Faça login novamente.');
+          setAuthReady(true);
+        }
+      } else {
+        // Nenhum usuário encontrado
+        setAuthReady(true);
+      }
+    };
+
+    void validateInitialUser();
+  }, []);
+
   useEffect(() => {
     if (typeof window === 'undefined') return undefined;
-    const unsubscribe = onAuthChange((user) => {
+    const unsubscribe = onAuthChange(async (user) => {
       setCurrentUser(user);
-      setAuthReady(true);
       if (user?.email) {
         setAuthEmail(user.email);
       }
@@ -1777,12 +1820,24 @@ const App: React.FC = () => {
     const fetch = async () => {
       setLoadingDisciplines(true);
       let remote = await loadGioConfigFromFirestore(currentUser.uid);
+
+      // Se não conseguiu carregar dados do Firestore, pode ser uma sessão inválida
       if (!remote) {
+        console.log('No Firestore data found for user, this might be an invalid session');
+        // Tentar inicializar dados padrão
         const initialized = await initializeFirestoreWithDefaultData(currentUser.uid);
         if (initialized) {
           remote = await loadGioConfigFromFirestore(currentUser.uid);
         }
+
+        // Se ainda não conseguiu carregar, considerar sessão inválida
+        if (!remote && isMounted) {
+          console.log('Failed to load or initialize data, session might be invalid');
+          setLoadingDisciplines(false);
+          return;
+        }
       }
+
       if (!isMounted) return;
 
       if (remote) {
@@ -1800,9 +1855,13 @@ const App: React.FC = () => {
           : [];
         setCalendarEntries(normalizedCalendar);
       } else {
-        setDisciplines(INITIAL_DISCIPLINES);
-        setExpandedDiscipline(INITIAL_DISCIPLINES[0]?.id ?? null);
-        setCalendarEntries([]);
+        // Se chegou aqui sem dados, forçar logout
+        console.log('No valid data found, forcing logout');
+        await signOutUser();
+        setCurrentUser(null);
+        setAuthReady(true);
+        setLoadingDisciplines(false);
+        return;
       }
 
       setStudySlots(INITIAL_STUDY_SLOTS);
@@ -2732,6 +2791,20 @@ const App: React.FC = () => {
       {authError && (
         <div className="auth-alert" role="alert">
           {authError}
+        </div>
+      )}
+
+      {sessionValidationError && (
+        <div className="auth-alert" role="alert">
+          {sessionValidationError}
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => setSessionValidationError(null)}
+            style={{ marginLeft: '1rem', fontSize: '0.8rem' }}
+          >
+            ✕
+          </button>
         </div>
       )}
 
